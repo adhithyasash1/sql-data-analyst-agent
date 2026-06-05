@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable
 
+import openai
 import sqlglot
 from openai import OpenAI
 from sqlglot import exp
@@ -201,6 +202,31 @@ def create_openai_client(settings: Settings) -> OpenAI:
     return OpenAI(base_url=settings.omlx_base_url, api_key=settings.omlx_api_key)
 
 
+def translate_model_error(exc: openai.OpenAIError, base_url: str) -> AppError:
+    """Convert an OpenAI/oMLX client error into an actionable AppError.
+
+    Catches the broad ``openai.OpenAIError`` base class so it is robust across SDK
+    versions, then maps the common cases to messages that name the server and what to check.
+    """
+    if isinstance(exc, openai.APIConnectionError):
+        return AppError(
+            f"Could not reach the model server at {base_url}. "
+            "Make sure your local oMLX server is running and OMLX_BASE_URL is correct."
+        )
+    if isinstance(exc, openai.AuthenticationError):
+        return AppError(f"The model server at {base_url} rejected the API key. Check OMLX_API_KEY.")
+    if isinstance(exc, openai.NotFoundError):
+        return AppError(
+            f"The model server at {base_url} could not find the requested model. "
+            "Check TEXT_TO_SQL_MODEL, EMBEDDING_MODEL, and SUMMARY_MODEL."
+        )
+    if isinstance(exc, openai.APIStatusError):
+        return AppError(f"Model server error ({exc.status_code}) from {base_url}: {exc}")
+    if isinstance(exc, openai.APIError):
+        return AppError(f"Model server request failed for {base_url}: {exc}")
+    return AppError(f"Model request failed for {base_url}: {exc}")
+
+
 @contextmanager
 def metadata_connection(path: Path) -> Iterator[sqlite3.Connection]:
     """Own the metadata transaction: commit on success, rollback on error, always close."""
@@ -312,12 +338,21 @@ def quote_identifier(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+def sqlite_readonly_uri(path: Path) -> str:
+    """Build a read-only SQLite URI from a filesystem path.
+
+    Uses Path.as_uri(), which requires an absolute path and percent-encodes
+    spaces and other special characters correctly.
+    """
+    return f"{path.expanduser().resolve().as_uri()}?mode=ro"
+
+
 def extract_schema(db_path: Path) -> list[TableSchema]:
     if not db_path.exists():
         raise ConfigError(f"Database not found at {db_path}.")
 
     try:
-        conn = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+        conn = sqlite3.connect(sqlite_readonly_uri(db_path), uri=True)
     except sqlite3.Error as exc:
         raise ConfigError(f"Could not open database read-only: {exc}") from exc
     try:
@@ -447,7 +482,11 @@ def embed_texts(
     embeddings: list[list[float]] = []
     for start in range(0, len(texts), batch_size):
         batch = [f"{instruction}\n{text}" for text in texts[start : start + batch_size]]
-        response = client.embeddings.create(model=model, input=batch)
+        try:
+            response = client.embeddings.create(model=model, input=batch)
+        except openai.OpenAIError as exc:
+            base_url = str(getattr(client, "base_url", "configured model server"))
+            raise translate_model_error(exc, base_url) from exc
         for item in sorted(response.data, key=lambda data: data.index):
             embeddings.append([float(value) for value in item.embedding])
     if len(embeddings) != len(texts):
@@ -864,16 +903,20 @@ def extract_usage(response: Any) -> UsageStats:
 
 
 def generate_sql(client: OpenAI, settings: Settings, prompt: str) -> GenerationResult:
-    response = client.chat.completions.create(
-        model=settings.text_to_sql_model,
-        messages=[
-            {"role": "system", "content": "You generate safe, precise SQLite SELECT queries."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=settings.sql_temperature,
-        top_p=settings.sql_top_p,
-        max_tokens=settings.max_sql_tokens,
-    )
+    try:
+        response = client.chat.completions.create(
+            model=settings.text_to_sql_model,
+            messages=[
+                {"role": "system", "content": "You generate safe, precise SQLite SELECT queries."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=settings.sql_temperature,
+            top_p=settings.sql_top_p,
+            max_tokens=settings.max_sql_tokens,
+        )
+    except openai.OpenAIError as exc:
+        base_url = str(getattr(client, "base_url", settings.omlx_base_url))
+        raise translate_model_error(exc, base_url) from exc
     content = response.choices[0].message.content or ""
     sql = extract_sql(content)
     return GenerationResult(sql=sql, initial_sql=sql, usage=extract_usage(response))
@@ -1044,7 +1087,7 @@ def execute_readonly_query(
     max_rows: int,
     timeout_ms: int,
 ) -> ExecutionResult:
-    uri = f"{db_path.as_uri()}?mode=ro"
+    uri = sqlite_readonly_uri(db_path)
     start = time.monotonic()
     try:
         conn = sqlite3.connect(uri, uri=True)
@@ -1657,9 +1700,38 @@ def download_northwind(settings: Settings, *, force: bool = False) -> tuple[Path
         raise
 
 
-def verify_northwind_database(path: Path) -> int:
+def verify_sqlite_database(path: Path) -> int:
+    """Validate that ``path`` is a readable SQLite database with user tables.
+
+    Distinguishes the failure modes so the user gets an actionable message:
+    a missing file, a file that is not a readable SQLite database, and a valid
+    but empty database are reported differently. Returns the user-table count.
+    """
+    if not path.exists():
+        raise AppError(f"Database not found: {path}")
     try:
-        with sqlite3.connect(path) as conn:
+        with sqlite3.connect(sqlite_readonly_uri(path), uri=True) as conn:
+            tables = [
+                str(row[0])
+                for row in conn.execute(
+                    """
+                    SELECT name
+                    FROM sqlite_master
+                    WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                    """
+                )
+            ]
+    except sqlite3.Error as exc:
+        raise AppError(f"Not a readable SQLite database: {path} ({exc})") from exc
+    if not tables:
+        raise AppError(f"No user tables found in SQLite database: {path}")
+    return len(tables)
+
+
+def verify_northwind_database(path: Path) -> int:
+    verify_sqlite_database(path)
+    try:
+        with sqlite3.connect(sqlite_readonly_uri(path), uri=True) as conn:
             rows = conn.execute(
                 """
                 SELECT name

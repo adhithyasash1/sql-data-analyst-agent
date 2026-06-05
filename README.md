@@ -1,13 +1,13 @@
-# Northwind Text-to-SQL CLI
+# SQLite Text-to-SQL CLI
 
-A local Text-to-SQL command-line application for the Northwind SQLite database. It inspects the database schema, embeds table-level schema documents with a local oMLX OpenAI-compatible embeddings endpoint, retrieves relevant schema through sqlite-vec, generates SQLite `SELECT` queries with a local oMLX-served model, validates them, executes them read-only, and renders results with Rich.
+A local Text-to-SQL command-line application for **any SQLite database**. Provide a path with `--db <path>` (it defaults to a bundled Northwind demo). It inspects the database schema, embeds table-level schema documents with a local oMLX OpenAI-compatible embeddings endpoint, retrieves relevant schema through sqlite-vec, generates SQLite `SELECT` queries with a local oMLX-served model, validates them, executes them read-only, and renders results with Rich.
 
 ## Architecture
 
 - `app.py`: Typer commands, interactive prompt, Rich output.
 - `core.py`: schema inspection, indexing, retrieval, prompting, SQL validation, read-only execution, summaries, logging.
 - `config.py`: pydantic-settings configuration loaded from `.env`.
-- `metadata.db`: local schema index, sqlite-vec vectors, and query logs.
+- `data/metadata/<db-stem>-<path-hash>.metadata.db`: per-source-database schema index, sqlite-vec vectors, index state, and query logs. Each source database gets its own metadata file, derived automatically from the database's absolute path, so different databases never share an index or logs.
 
 The runtime path is intentionally bounded:
 
@@ -43,41 +43,57 @@ Edit `.env` and set `OMLX_API_KEY` to any non-empty local value accepted by your
 
 ## Database
 
-Download the pinned Northwind SQLite database:
+The app works with **any SQLite database file** (`.db`, `.sqlite`, `.sqlite3` — the file is validated by opening it, not by its extension). Provide a path with `--db <path>` on the `ask`, `index`, and `logs` commands. When `--db` is omitted, the bundled Northwind demo at `data/northwind.db` is used.
+
+### Use your own database
+
+```bash
+uv run python app.py ask --db /path/to/your.db "List the 10 most recent orders"
+```
+
+The first run for a new database automatically builds its schema index (when `AUTO_REINDEX=true`). The index and query logs live in a per-database metadata file under `data/metadata/`, keyed by the database's absolute path — so switching between databases never re-embeds or mixes logs. Metadata is tied to the *path*: the same database copied to two locations gets two metadata files. Relative paths like `data/metadata/` resolve against your current working directory.
+
+### Demo database (optional)
+
+Download the pinned Northwind SQLite database to try the app quickly:
 
 ```bash
 uv run python app.py download-northwind
 ```
 
-The command downloads `dist/northwind.db` from `jpwhite3/northwind-SQLite3`, pinned to commit `4f56e7f5906dfd23b25244c5bfe8fb5da6402efd`, verifies core Northwind tables, and saves it to `data/northwind.db`. The upstream database is MIT licensed.
-
-You can also place a compatible Northwind SQLite file manually at `data/northwind.db`.
+The command downloads `dist/northwind.db` from `jpwhite3/northwind-SQLite3`, pinned to commit `4f56e7f5906dfd23b25244c5bfe8fb5da6402efd`, verifies core Northwind tables, and saves it to the configured `DB_PATH` (default `data/northwind.db`). The upstream database is MIT licensed.
 
 ## Usage
+
+Place the `--db` option before the question argument. When omitted, the default demo database is used.
 
 Build or rebuild the schema index:
 
 ```bash
-uv run python app.py index
+uv run python app.py index                       # default demo database
+uv run python app.py index --db data/your.db     # your database
 ```
 
 Start the interactive assistant:
 
 ```bash
-uv run python app.py ask
+uv run python app.py ask --db data/your.db
 ```
 
 Ask one question and exit:
 
 ```bash
+# Demo database (default)
 uv run python app.py ask "Which customers placed the most orders?"
+# Your own SQLite database (option before the question)
+uv run python app.py ask --db data/your.db "List the 5 most recent orders"
 ```
 
-Show recent query logs:
+Show recent query logs (scoped to the selected database):
 
 ```bash
-uv run python app.py logs
-uv run python app.py logs --limit 25 --verbose
+uv run python app.py logs --db data/your.db
+uv run python app.py logs --db data/your.db --limit 25 --verbose
 ```
 
 Run tests:
@@ -90,10 +106,10 @@ uv run pytest
 
 Important settings in `.env`:
 
-- `NORTHWIND_DB_PATH`: source SQLite database.
-- `METADATA_DB_PATH`: schema index and local query log database.
+- `DB_PATH`: default source SQLite database used when `--db` is not given.
+- `METADATA_DB_PATH`: advanced/debug override for the metadata (index + logs) database. Leave **unset** so each source database gets its own auto-derived metadata file under `data/metadata/`. The `--metadata-db` CLI option overrides it per run.
 - `AUTO_REINDEX`: when true, `ask` rebuilds the schema index if the schema/model/path changed.
-- `ENABLE_RESULT_SHAPE_CHECK`: enables lightweight result-shape heuristics.
+- `ENABLE_RESULT_SHAPE_CHECK`: enables lightweight result-shape heuristics (tuned for typical business questions). If you see spurious result warnings on an unusual schema, set this to `false`.
 - `MAX_REPAIR_ATTEMPTS`: total repair budget, default `1`.
 - `REQUIRE_SQL_APPROVAL`: ask before executing validated SQL.
 - `ENABLE_LLM_SUMMARY`: optional second model call for grounded summaries, default `false`.

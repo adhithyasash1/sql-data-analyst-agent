@@ -1,7 +1,26 @@
+import hashlib
 from pathlib import Path
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def default_metadata_path_for_source(source_db_path: Path) -> Path:
+    """Derive a deterministic, per-source-database metadata DB path.
+
+    The path is keyed on the source database's absolute path so that distinct
+    databases (even same-named ones in different directories) never share a
+    metadata/index file. The filename stays path-only so query logs remain
+    stable across embedding-model or schema changes; model/dimension/fingerprint
+    checks live inside the index state and are handled by ensure_index_ready().
+    """
+    resolved = source_db_path.expanduser().resolve()
+    digest = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:12]
+    safe_stem = "".join(
+        char if char.isalnum() or char in {"-", "_"} else "_"
+        for char in resolved.stem
+    )
+    return Path("data/metadata") / f"{safe_stem}-{digest}.metadata.db"
 
 
 class Settings(BaseSettings):
@@ -12,8 +31,8 @@ class Settings(BaseSettings):
     text_to_sql_model: str = "MLX-Qwopus3.5-9B-v3-4bit"
     summary_model: str = "MLX-Qwopus3.5-9B-v3-4bit"
     embedding_model: str = "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ"
-    northwind_db_path: Path = Path("data/northwind.db")
-    metadata_db_path: Path = Path("data/metadata.db")
+    db_path: Path = Path("data/northwind.db")
+    metadata_db_path: Path | None = None
     retrieval_top_k: int = 6
     max_result_rows: int = 50
     max_sql_tokens: int = 2048
@@ -68,11 +87,13 @@ class Settings(BaseSettings):
 
     @property
     def source_db_path(self) -> Path:
-        return self.northwind_db_path.expanduser().resolve()
+        return self.db_path.expanduser().resolve()
 
     @property
     def metadata_path(self) -> Path:
-        return self.metadata_db_path.expanduser().resolve()
+        if self.metadata_db_path is not None:
+            return self.metadata_db_path.expanduser().resolve()
+        return default_metadata_path_for_source(self.source_db_path).resolve()
 
     def validate_runtime(self) -> None:
         if not self.omlx_api_key or self.omlx_api_key == "replace-me":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Annotated
 
 import typer
@@ -20,15 +21,21 @@ from core import (
     download_northwind,
     index_schema,
     read_query_logs,
+    verify_sqlite_database,
 )
 
-app = typer.Typer(add_completion=False, help="Local Text-to-SQL for Northwind SQLite.")
+app = typer.Typer(add_completion=False, help="Local Text-to-SQL for any SQLite database.")
 console = Console()
 
 
-def load_settings() -> Settings:
+def load_settings(db: Path | None = None, metadata_db: Path | None = None) -> Settings:
+    overrides: dict[str, Path] = {}
+    if db is not None:
+        overrides["db_path"] = db
+    if metadata_db is not None:
+        overrides["metadata_db_path"] = metadata_db
     try:
-        return Settings()
+        return Settings(**overrides)
     except ValidationError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
@@ -41,7 +48,9 @@ def download_northwind_cmd(
     settings = load_settings()
     console.print(
         Panel.fit(
-            f"Source: {NORTHWIND_DOWNLOAD_URL}\nPinned commit: {NORTHWIND_DOWNLOAD_SHA}\nLicense: MIT upstream",
+            f"Destination: {settings.source_db_path}\n"
+            f"Source: {NORTHWIND_DOWNLOAD_URL}\n"
+            f"Pinned commit: {NORTHWIND_DOWNLOAD_SHA}\nLicense: MIT upstream",
             title="Northwind Download",
         )
     )
@@ -58,10 +67,17 @@ def download_northwind_cmd(
 
 
 @app.command()
-def index() -> None:
-    """Inspect Northwind and build the sqlite-vec schema index."""
-    settings = load_settings()
+def index(
+    db: Annotated[Path | None, typer.Option("--db", help="Path to a SQLite database file.")] = None,
+    metadata_db: Annotated[
+        Path | None,
+        typer.Option("--metadata-db", hidden=True, help="Advanced: override the per-database metadata DB."),
+    ] = None,
+) -> None:
+    """Inspect the database and build the sqlite-vec schema index."""
+    settings = load_settings(db, metadata_db)
     try:
+        verify_sqlite_database(settings.source_db_path)
         client = create_openai_client(settings)
         with console.status("Indexing schema with local embeddings..."):
             summary = index_schema(settings, client)
@@ -85,11 +101,17 @@ def index() -> None:
 @app.command()
 def ask(
     question: Annotated[str | None, typer.Argument(help="Optional one-shot question.")] = None,
+    db: Annotated[Path | None, typer.Option("--db", help="Path to a SQLite database file.")] = None,
+    metadata_db: Annotated[
+        Path | None,
+        typer.Option("--metadata-db", hidden=True, help="Advanced: override the per-database metadata DB."),
+    ] = None,
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Show diagnostics.")] = False,
 ) -> None:
     """Ask a question once, or start the interactive prompt when no question is supplied."""
-    settings = load_settings()
+    settings = load_settings(db, metadata_db)
     try:
+        verify_sqlite_database(settings.source_db_path)
         client = create_openai_client(settings)
     except AppError as exc:
         console.print(Panel(str(exc), title="Configuration error", border_style="red"))
@@ -99,7 +121,12 @@ def ask(
         result = run_question(settings, client, question, verbose)
         raise typer.Exit(0 if result.success else 1)
 
-    console.print(Panel.fit("Database: Northwind\nType 'exit' to quit.", title="Text-to-SQL Assistant"))
+    console.print(
+        Panel.fit(
+            f"Database: {settings.source_db_path.name}\nType 'exit' to quit.",
+            title="Text-to-SQL Assistant",
+        )
+    )
     while True:
         user_input = Prompt.ask("[bold]You[/bold]").strip()
         if user_input.lower() in {"exit", "quit", ":q"}:
@@ -111,14 +138,19 @@ def ask(
 
 @app.command()
 def logs(
+    db: Annotated[Path | None, typer.Option("--db", help="Path to a SQLite database file.")] = None,
+    metadata_db: Annotated[
+        Path | None,
+        typer.Option("--metadata-db", hidden=True, help="Advanced: override the per-database metadata DB."),
+    ] = None,
     limit: Annotated[int, typer.Option("--limit", "-n", min=1, max=100)] = 10,
     verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
 ) -> None:
-    """Show recent query logs."""
-    settings = load_settings()
+    """Show recent query logs for the selected database."""
+    settings = load_settings(db, metadata_db)
     rows = read_query_logs(settings, limit)
     if not rows:
-        console.print("No query logs found.")
+        console.print(f"No query logs found for database: {settings.source_db_path.name}")
         return
 
     table = Table(title=f"Last {len(rows)} query logs")

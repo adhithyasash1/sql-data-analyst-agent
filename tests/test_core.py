@@ -4,10 +4,13 @@ import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
+import openai
 import pytest
 
 from core import (
     AnswerResult,
+    AppError,
     IndexStateError,
     SQL_REPAIR_RULES,
     SqlValidationError,
@@ -17,6 +20,7 @@ from core import (
     build_validation_repair_prompt,
     check_result_shape,
     deterministic_summary,
+    embed_texts,
     execute_readonly_query,
     extract_schema,
     extract_sql,
@@ -32,9 +36,10 @@ from core import (
     schema_fingerprint,
     set_kv,
     setup_metadata,
+    translate_model_error,
     validate_sql,
 )
-from config import Settings
+from config import Settings, default_metadata_path_for_source
 
 
 def create_small_db(path: Path) -> None:
@@ -381,7 +386,7 @@ def test_retrieval_returns_schema_object(db_path: Path, tmp_path: Path) -> None:
     pytest.importorskip("sqlite_vec")
     settings = Settings(
         omlx_api_key="test",
-        northwind_db_path=db_path,
+        db_path=db_path,
         metadata_db_path=tmp_path / "metadata.db",
         embedding_batch_size=2,
         retrieval_top_k=2,
@@ -538,7 +543,7 @@ def test_shape_repair_prompt_keeps_dynamic_sections() -> None:
 def test_read_query_logs_returns_dict_rows_with_expected_keys(tmp_path: Path) -> None:
     settings = Settings(
         omlx_api_key="test",
-        northwind_db_path=tmp_path / "northwind.db",
+        db_path=tmp_path / "northwind.db",
         metadata_db_path=tmp_path / "metadata.db",
     )
     result = AnswerResult(question="hi", retrieved_tables=["Customers"], expanded_tables=[])
@@ -601,7 +606,7 @@ class FakeSqlClient:
 def _answer_settings(db_path: Path, tmp_path: Path, **overrides: object) -> Settings:
     base: dict[str, object] = dict(
         omlx_api_key="test",
-        northwind_db_path=db_path,
+        db_path=db_path,
         metadata_db_path=tmp_path / "metadata.db",
         embedding_batch_size=2,
         retrieval_top_k=4,
@@ -691,3 +696,93 @@ def test_answer_question_cancelled_by_approval(db_path: Path, tmp_path: Path) ->
     assert seen["sql"] == "SELECT CompanyName FROM Customers"
     logs = read_query_logs(settings, 10)
     assert logs and logs[0]["cancelled"] == 1
+
+
+def create_books_db(path: Path) -> None:
+    """A deliberately non-Northwind schema, to prove database independence."""
+    with sqlite3.connect(path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE authors (
+                author_id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL
+            );
+            CREATE TABLE books (
+                book_id INTEGER PRIMARY KEY,
+                author_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                published_year INTEGER,
+                FOREIGN KEY (author_id) REFERENCES authors(author_id)
+            );
+            INSERT INTO authors VALUES (1, 'Ursula K. Le Guin');
+            INSERT INTO authors VALUES (2, 'Octavia Butler');
+            INSERT INTO books VALUES (1, 1, 'A Wizard of Earthsea', 1968);
+            INSERT INTO books VALUES (2, 2, 'Kindred', 1979);
+            INSERT INTO books VALUES (3, 1, 'The Dispossessed', 1974);
+            """
+        )
+
+
+def test_answer_question_works_on_non_northwind_schema(tmp_path: Path) -> None:
+    _require_loadable_sqlite_vec()
+    db = tmp_path / "books.db"
+    create_books_db(db)
+    settings = _answer_settings(db, tmp_path)
+    client = FakeSqlClient(
+        [
+            "SELECT b.title, a.name FROM books AS b "
+            "JOIN authors AS a ON b.author_id = a.author_id ORDER BY b.title"
+        ]
+    )
+    result = answer_question(settings, client, "List book titles and author names.")  # type: ignore[arg-type]
+    assert result.success is True
+    assert result.executed is True
+    assert result.columns == ("title", "name")
+    assert ("Kindred", "Octavia Butler") in result.rows
+
+
+def test_default_metadata_path_is_path_based(tmp_path: Path) -> None:
+    p1 = default_metadata_path_for_source(tmp_path / "shop.db")
+    p2 = default_metadata_path_for_source(tmp_path / "copy" / "shop.db")
+    assert p1 != p2  # same name, different dirs -> different metadata files
+    assert p1.name.startswith("shop-")
+    assert p1.name.endswith(".metadata.db")
+    assert default_metadata_path_for_source(tmp_path / "shop.db") == p1  # deterministic
+
+
+def test_translate_model_error_connection() -> None:
+    request = httpx.Request("POST", "http://127.0.0.1:8000/v1/embeddings")
+    err = translate_model_error(openai.APIConnectionError(request=request), "http://127.0.0.1:8000/v1")
+    assert isinstance(err, AppError)
+    assert "Could not reach the model server" in str(err)
+    assert "127.0.0.1:8000" in str(err)
+
+
+def test_translate_model_error_fallback() -> None:
+    class FakeOpenAIError(openai.OpenAIError):
+        pass
+
+    err = translate_model_error(FakeOpenAIError("boom"), "http://127.0.0.1:8000/v1")
+    assert isinstance(err, AppError)
+    assert "Model request failed" in str(err)
+    assert "127.0.0.1:8000" in str(err)
+
+
+class _BoomEmbeddings:
+    def create(self, model: str, input: list[str]) -> object:
+        del model, input
+        raise openai.APIConnectionError(
+            request=httpx.Request("POST", "http://127.0.0.1:8000/v1/embeddings")
+        )
+
+
+class _BoomClient:
+    base_url = "http://127.0.0.1:8000/v1"
+    embeddings = _BoomEmbeddings()
+
+
+def test_embed_texts_translates_connection_error() -> None:
+    with pytest.raises(AppError) as excinfo:
+        embed_texts(_BoomClient(), "model", ["x"], 2, instruction="i")  # type: ignore[arg-type]
+    assert "Could not reach the model server" in str(excinfo.value)
+    assert "127.0.0.1:8000" in str(excinfo.value)
