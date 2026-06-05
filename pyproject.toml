@@ -1,0 +1,23 @@
+[project]
+name = "northwind-text-to-sql"
+version = "0.1.0"
+description = "A local Text-to-SQL CLI for the Northwind SQLite database."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.99.0",
+    "pydantic-settings>=2.10.0",
+    "rich>=14.0.0",
+    "sqlglot>=26.0.0",
+    "sqlite-vec>=0.1.9",
+    "typer>=0.16.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
