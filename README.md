@@ -1,6 +1,6 @@
 # SQLite Text-to-SQL CLI
 
-A local Text-to-SQL command-line application for **any SQLite database**. Provide a path with `--db <path>` (it defaults to a bundled Northwind demo). It inspects the database schema, embeds table-level schema documents with a local oMLX OpenAI-compatible embeddings endpoint, retrieves relevant schema through sqlite-vec, generates SQLite `SELECT` queries with a local oMLX-served model, validates them, executes them read-only, and renders results with Rich.
+A local Text-to-SQL command-line application for **any SQLite database**. Provide a path with `--db <path>` (it defaults to a bundled Northwind demo). It inspects the database schema (tables and views), optionally profiles each object with bounded, read-only sample values, embeds table/view-level schema documents with a local oMLX OpenAI-compatible embeddings endpoint, retrieves relevant schema through sqlite-vec, generates SQLite `SELECT` queries with a local oMLX-served model, validates them, executes them read-only, and renders results with Rich.
 
 ## Architecture
 
@@ -11,7 +11,7 @@ A local Text-to-SQL command-line application for **any SQLite database**. Provid
 
 The runtime path is intentionally bounded:
 
-1. retrieve table-level schema objects
+1. retrieve table/view-level schema objects
 2. expand one hop through foreign-key relationships
 3. generate candidate SQL
 4. validate structural safety with SQLGlot and schema checks
@@ -114,8 +114,15 @@ Important settings in `.env`:
 - `REQUIRE_SQL_APPROVAL`: ask before executing validated SQL.
 - `ENABLE_LLM_SUMMARY`: optional second model call for grounded summaries, default `false`.
 - `ENABLE_QUERY_LOGGING`: stores local query logs, default `true`.
+- `ENABLE_SCHEMA_PROFILING`: adds bounded row counts and sample values to schema documents, default `true`. Set `false` to skip profiling.
+- `MAX_PROFILE_VALUES`: sample values collected per column during profiling, default `3`.
+- `MAX_PROFILE_TEXT_LENGTH`: maximum characters kept per sampled text value, default `80`.
 
 If only row data changes while table schema is unchanged, the app warns but does not reindex. If table schema changes, `ask` auto-reindexes before answering when `AUTO_REINDEX=true`.
+
+### Schema profiling
+
+Schema profiling adds bounded row counts and sample values to table/view-level schema documents to improve SQL generation on unfamiliar databases. It can be disabled with `ENABLE_SCHEMA_PROFILING=false`. Profiling reads only through the read-only SQLite connection and never modifies the source database; profiles are built at index time and refreshed whenever the schema or profiling settings change. Views are profiled lightly (sample values only; no `COUNT(*)` or `MIN`/`MAX`).
 
 ## Safety Boundaries
 
@@ -124,7 +131,7 @@ If only row data changes while table schema is unchanged, the app warns but does
 - Prohibited commands include `INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`, `CREATE`, `PRAGMA`, `ATTACH`, and `DETACH`.
 - SQL comments are rejected.
 - SQLite system tables are rejected.
-- Known tables are validated strictly; column checks are pragmatic for aliases and CTEs.
+- Tables and views are allowed as read-only SELECT sources and validated strictly; column checks are pragmatic for aliases and CTEs.
 - Queries run through `sqlite3` with `mode=ro`, extension loading disabled, row limits, and a progress-handler timeout.
 - sqlite-vec is loaded only for the metadata database, never for the source database.
 
@@ -136,10 +143,14 @@ If only row data changes while table schema is unchanged, the app warns but does
 - What is the total freight by ship country?
 - Which suppliers provide the most products?
 
+## Evals
+
+`evals/northwind_questions.jsonl` and `evals/chinook_questions.jsonl` are small JSON-per-line regression/eval prompts (each line carries a `question` and an `expectation`) used for manual or future automated checks of result-shape behavior such as total counts vs. grouped breakdowns. They are documentation-oriented; there is no eval runner yet.
+
 ## Known Limitations
 
 - Runtime validation is not a semantic correctness judge.
-- Views are not indexed or allowed in v1.
+- Tables and views are indexed. Queries remain read-only and SELECT-only.
 - No live oMLX integration tests are included.
 - No full prompt or result-row logging is implemented.
 - Result-shape checks are conservative heuristics and may warn on valid answers.

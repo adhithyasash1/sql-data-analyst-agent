@@ -22,6 +22,7 @@ from sqlglot import exp
 from config import Settings
 
 METADATA_SCHEMA_VERSION = "1"
+SCHEMA_DOCUMENT_VERSION = "2"
 NORTHWIND_DOWNLOAD_SHA = "4f56e7f5906dfd23b25244c5bfe8fb5da6402efd"
 NORTHWIND_DOWNLOAD_URL = (
     "https://raw.githubusercontent.com/jpwhite3/northwind-SQLite3/"
@@ -89,6 +90,22 @@ class TableSchema:
     columns: tuple[ColumnInfo, ...]
     primary_key: tuple[str, ...]
     foreign_keys: tuple[ForeignKeyInfo, ...]
+    kind: str = "table"
+
+
+@dataclass(frozen=True)
+class ColumnProfile:
+    name: str
+    sample_values: tuple[str, ...] = ()
+    minimum: str | None = None
+    maximum: str | None = None
+    is_blob: bool = False
+
+
+@dataclass(frozen=True)
+class TableProfile:
+    row_count: int | None = None
+    columns: tuple[ColumnProfile, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -142,6 +159,7 @@ class ShapeExpectation:
     order_direction: str | None = None
     aggregate_kind: str | None = None
     expected_limit: int | None = None
+    is_total_count: bool = False
 
     @property
     def has_expectations(self) -> bool:
@@ -150,6 +168,7 @@ class ShapeExpectation:
             or self.requires_numeric
             or self.requires_order
             or self.expected_limit is not None
+            or self.is_total_count
         )
 
 
@@ -356,22 +375,26 @@ def extract_schema(db_path: Path) -> list[TableSchema]:
     except sqlite3.Error as exc:
         raise ConfigError(f"Could not open database read-only: {exc}") from exc
     try:
-        table_names = [
-            str(name)
-            for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        objects = [
+            (str(name), str(obj_type))
+            for (name, obj_type) in conn.execute(
+                "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view')"
+            )
             if not str(name).lower().startswith("sqlite_")
         ]
-        tables = [read_table_schema(conn, name) for name in table_names]
+        tables = [read_table_schema(conn, name, kind=obj_type) for name, obj_type in objects]
     finally:
         conn.close()
 
     tables.sort(key=lambda table: table.name.lower())
     if not tables:
-        raise ConfigError(f"No user tables found in {db_path}.")
+        raise ConfigError(f"No user tables or views found in {db_path}.")
     return tables
 
 
-def read_table_schema(conn: sqlite3.Connection, table_name: str) -> TableSchema:
+def read_table_schema(
+    conn: sqlite3.Connection, table_name: str, kind: str = "table"
+) -> TableSchema:
     quoted = quote_identifier(table_name)
     columns: list[ColumnInfo] = []
     pk_members: list[tuple[int, str]] = []
@@ -390,7 +413,7 @@ def read_table_schema(conn: sqlite3.Connection, table_name: str) -> TableSchema:
         )
     primary_key = tuple(name for _, name in sorted(pk_members))
     foreign_keys = read_foreign_keys(conn, quoted)
-    return TableSchema(table_name, tuple(columns), primary_key, foreign_keys)
+    return TableSchema(table_name, tuple(columns), primary_key, foreign_keys, kind=kind)
 
 
 def read_foreign_keys(conn: sqlite3.Connection, quoted_table: str) -> tuple[ForeignKeyInfo, ...]:
@@ -413,8 +436,13 @@ def read_foreign_keys(conn: sqlite3.Connection, quoted_table: str) -> tuple[Fore
     return tuple(foreign_keys)
 
 
-def build_schema_document(table: TableSchema) -> SchemaDocument:
-    lines = ["Object type: table", f"Table: {table.name}", "Columns:"]
+def build_schema_document(
+    table: TableSchema, profile: TableProfile | None = None
+) -> SchemaDocument:
+    is_view = table.kind == "view"
+    kind_label = "view" if is_view else "table"
+    object_label = "View" if is_view else "Table"
+    lines = [f"Object type: {kind_label}", f"{object_label}: {table.name}", "Columns:"]
     pk_set = set(table.primary_key)
     for column in table.columns:
         bits = [f"- {column.name}", column.data_type]
@@ -434,17 +462,179 @@ def build_schema_document(table: TableSchema) -> SchemaDocument:
             lines.append(f"- {left} references {right}")
     else:
         lines.append("- none")
+
+    if profile is not None:
+        lines.extend(profile_document_lines(table, profile))
     return SchemaDocument(table.name, "\n".join(lines))
 
 
-def build_schema_documents(tables: list[TableSchema]) -> list[SchemaDocument]:
-    return [build_schema_document(table) for table in tables]
+def profile_document_lines(table: TableSchema, profile: TableProfile) -> list[str]:
+    lines = ["Profile (sampled from a read-only connection):"]
+    if profile.row_count is not None:
+        lines.append(f"- Row count: {profile.row_count}")
+    elif table.kind == "view":
+        lines.append("- Row count: not profiled (view)")
+    for column in profile.columns:
+        if column.is_blob:
+            lines.append(f"- {column.name}: binary data (not profiled)")
+            continue
+        bits: list[str] = []
+        if column.sample_values:
+            bits.append("samples: " + ", ".join(column.sample_values))
+        if column.minimum is not None or column.maximum is not None:
+            bits.append(f"min: {column.minimum}, max: {column.maximum}")
+        if bits:
+            lines.append(f"- {column.name}: " + "; ".join(bits))
+    return lines
+
+
+def build_schema_documents(
+    tables: list[TableSchema], profiles: dict[str, TableProfile] | None = None
+) -> list[SchemaDocument]:
+    profiles = profiles or {}
+    return [build_schema_document(table, profiles.get(table.name)) for table in tables]
+
+
+def is_numeric_declared_type(declared_type: str) -> bool:
+    upper = (declared_type or "").upper()
+    return any(token in upper for token in ("INT", "REAL", "FLOA", "DOUB", "NUMERIC", "DECIMAL"))
+
+
+def is_blob_declared_type(declared_type: str) -> bool:
+    return "BLOB" in (declared_type or "").upper()
+
+
+def format_profile_value(value: Any, max_len: int) -> str | None:
+    """Render one sampled value for a schema document, or None to skip it.
+
+    BLOB-like values are skipped so binary data never lands in a prompt; long text is
+    truncated to ``max_len`` characters with a trailing ellipsis.
+    """
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return None
+    text = str(value)
+    if len(text) > max_len:
+        return text[:max_len] + "…"
+    return text
+
+
+def profile_table(
+    conn: sqlite3.Connection, table: TableSchema, settings: Settings
+) -> TableProfile:
+    """Collect a bounded, read-only profile for one table or view.
+
+    Row counts and MIN/MAX are skipped for views (their queries can be expensive). Every
+    sub-query is isolated so a single failure degrades that piece only, never the table.
+    """
+    is_view = table.kind == "view"
+    quoted_table = quote_identifier(table.name)
+
+    row_count: int | None = None
+    if not is_view:
+        try:
+            row = conn.execute(f"SELECT COUNT(*) FROM {quoted_table}").fetchone()
+            row_count = int(row[0]) if row and row[0] is not None else None
+        except sqlite3.Error:
+            row_count = None
+
+    column_profiles: list[ColumnProfile] = []
+    for column in table.columns:
+        if is_blob_declared_type(column.data_type):
+            column_profiles.append(ColumnProfile(name=column.name, is_blob=True))
+            continue
+        quoted_col = quote_identifier(column.name)
+        sample_values: tuple[str, ...] = ()
+        try:
+            rows = conn.execute(
+                f"SELECT {quoted_col} FROM {quoted_table} "
+                f"WHERE {quoted_col} IS NOT NULL LIMIT ?",
+                (settings.max_profile_values,),
+            ).fetchall()
+            formatted = [
+                rendered
+                for (value,) in rows
+                if (rendered := format_profile_value(value, settings.max_profile_text_length))
+                is not None
+            ]
+            sample_values = tuple(formatted)
+        except sqlite3.Error:
+            sample_values = ()
+
+        minimum: str | None = None
+        maximum: str | None = None
+        if not is_view and is_numeric_declared_type(column.data_type):
+            try:
+                bounds = conn.execute(
+                    f"SELECT MIN({quoted_col}), MAX({quoted_col}) FROM {quoted_table}"
+                ).fetchone()
+                if bounds:
+                    minimum = None if bounds[0] is None else str(bounds[0])
+                    maximum = None if bounds[1] is None else str(bounds[1])
+            except sqlite3.Error:
+                minimum = maximum = None
+
+        column_profiles.append(
+            ColumnProfile(column.name, sample_values, minimum, maximum, is_blob=False)
+        )
+    return TableProfile(row_count=row_count, columns=tuple(column_profiles))
+
+
+def profile_tables(
+    db_path: Path, tables: list[TableSchema], settings: Settings
+) -> dict[str, TableProfile]:
+    """Profile each table/view through a single bounded, read-only connection.
+
+    Never loads sqlite-vec. A progress-handler timeout keeps profiling from hanging on a
+    huge or expensive object, and per-table isolation prevents one failure from aborting
+    the rest.
+    """
+    profiles: dict[str, TableProfile] = {}
+    try:
+        conn = sqlite3.connect(sqlite_readonly_uri(db_path), uri=True)
+    except sqlite3.Error:
+        return profiles
+    try:
+        try:
+            conn.enable_load_extension(False)
+        except sqlite3.Error:
+            pass
+
+        start = time.monotonic()
+
+        def progress_handler() -> int:
+            return 1 if (time.monotonic() - start) * 1000 > settings.query_timeout_ms else 0
+
+        conn.set_progress_handler(progress_handler, 1000)
+        for table in tables:
+            try:
+                profiles[table.name] = profile_table(conn, table, settings)
+            except sqlite3.Error:
+                continue
+    finally:
+        try:
+            conn.set_progress_handler(None, 0)
+        finally:
+            conn.close()
+    return profiles
+
+
+def schema_documents_for_index(
+    settings: Settings, tables: list[TableSchema]
+) -> list[SchemaDocument]:
+    """Build schema documents for indexing, profiling once when enabled."""
+    profiles = (
+        profile_tables(settings.source_db_path, tables, settings)
+        if settings.enable_schema_profiling
+        else None
+    )
+    return build_schema_documents(tables, profiles)
 
 
 def schema_fingerprint(tables: list[TableSchema]) -> str:
     payload = [
         {
             "name": table.name,
+            "kind": table.kind,
             "columns": [
                 {
                     "name": column.name,
@@ -469,6 +659,22 @@ def schema_fingerprint(tables: list[TableSchema]) -> str:
     ]
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def schema_document_signature(settings: Settings) -> str:
+    """Signature of how schema documents are rendered/profiled.
+
+    A change here (doc-format version bump, profiling toggled, or profiling limits changed)
+    means stored documents are stale even when the schema fingerprint is unchanged, so
+    ``ensure_index_ready`` reindexes once.
+    """
+    payload = {
+        "doc_version": SCHEMA_DOCUMENT_VERSION,
+        "profiling": settings.enable_schema_profiling,
+        "max_profile_values": settings.max_profile_values,
+        "max_profile_text_length": settings.max_profile_text_length,
+    }
+    return json.dumps(payload, sort_keys=True)
 
 
 def embed_texts(
@@ -500,7 +706,8 @@ def index_schema(
     source_path = settings.source_db_path
     if tables is None:
         tables = extract_schema(source_path)
-    documents = build_schema_documents(tables)
+    documents = schema_documents_for_index(settings, tables)
+    kind_by_name = {table.name: table.kind for table in tables}
     texts = [document.content for document in documents]
     embeddings = embed_texts(
         client,
@@ -532,9 +739,10 @@ def index_schema(
                     object_type, object_name, table_name, content,
                     embedding_model, embedding_dimension, created_at
                 )
-                VALUES ('table', ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    kind_by_name.get(document.table_name, "table"),
                     document.table_name,
                     document.table_name,
                     document.content,
@@ -554,6 +762,7 @@ def index_schema(
         set_kv(conn, "source_db_size", stat.st_size)
         set_kv(conn, "source_db_mtime_ns", stat.st_mtime_ns)
         set_kv(conn, "schema_fingerprint", schema_fingerprint(tables))
+        set_kv(conn, "schema_document_signature", schema_document_signature(settings))
         set_kv(conn, "indexed_at", created_at)
     return IndexSummary(len(documents), dimension, metadata_path, created_at)
 
@@ -582,6 +791,7 @@ def ensure_index_ready(
         stored_model = get_kv(conn, "embedding_model")
         stored_path = get_kv(conn, "source_db_path")
         stored_fingerprint = get_kv(conn, "schema_fingerprint")
+        stored_signature = get_kv(conn, "schema_document_signature")
         stored_size = get_kv(conn, "source_db_size")
         stored_mtime = get_kv(conn, "source_db_mtime_ns")
 
@@ -591,6 +801,7 @@ def ensure_index_ready(
         or stored_model != settings.embedding_model
         or stored_path != str(settings.source_db_path)
         or stored_fingerprint != current_fingerprint
+        or stored_signature != schema_document_signature(settings)
     )
     if must_reindex:
         if settings.auto_reindex:
@@ -644,6 +855,25 @@ def retrieve_schema(
     ]
 
 
+def load_indexed_documents(settings: Settings) -> list[SchemaDocument]:
+    """Return the schema documents stored at index time (profiled when profiling is on).
+
+    Reused for prompts so the model sees exactly what was embedded, and so profiling runs
+    only during indexing rather than on every question.
+    """
+    with metadata_connection(settings.metadata_path) as conn:
+        setup_metadata(conn)
+        rows = conn.execute(
+            "SELECT object_name, content FROM schema_objects ORDER BY object_name"
+        ).fetchall()
+    documents = [SchemaDocument(str(name), str(content)) for name, content in rows]
+    if not documents:
+        raise IndexStateError(
+            "Schema index is empty. Run uv run python app.py index or enable AUTO_REINDEX."
+        )
+    return documents
+
+
 def relationship_neighbors(tables: list[TableSchema]) -> dict[str, set[str]]:
     neighbors: dict[str, set[str]] = {table.name: set() for table in tables}
     for table in tables:
@@ -685,6 +915,24 @@ def quote_guidance() -> str:
     return "Use double quotes for identifiers with spaces or special characters."
 
 
+BREAKDOWN_RE = re.compile(
+    r"\b(per|each|every|across|grouped\s+by|group\s+by|break\s*down|breakdown)\b|\bby\s+\w+"
+)
+
+
+def question_has_count_intent(question: str) -> bool:
+    """True when the question asks to count rows (how many / count / number of)."""
+    text = question.lower()
+    return "how many" in text or "number of" in text or re.search(r"\bcount\b", text) is not None
+
+
+def is_total_count_question(question: str) -> bool:
+    """A count question with no breakdown phrase expects a single total (no GROUP BY)."""
+    if not question_has_count_intent(question):
+        return False
+    return BREAKDOWN_RE.search(question.lower()) is None
+
+
 def infer_shape_expectation(question: str) -> ShapeExpectation:
     text = question.lower()
     entity_specs = [
@@ -703,6 +951,10 @@ def infer_shape_expectation(question: str) -> ShapeExpectation:
         if match:
             entity_matches.append((match.start(), terms))
     entity_terms = list(min(entity_matches, key=lambda item: item[0])[1]) if entity_matches else []
+    if question_has_count_intent(question):
+        # A counted entity is aggregated into a metric, not rendered as a label column,
+        # so do not require an entity label for "how many / count / number of" questions.
+        entity_terms = []
 
     numeric_words = (
         "count",
@@ -756,6 +1008,7 @@ def infer_shape_expectation(question: str) -> ShapeExpectation:
         order_direction=order_direction,
         aggregate_kind=aggregate_kind,
         expected_limit=expected_limit,
+        is_total_count=is_total_count_question(question),
     )
 
 
@@ -763,6 +1016,11 @@ def shape_expectation_text(expectation: ShapeExpectation) -> str:
     if not expectation.has_expectations:
         return "- No special result-shape constraint inferred."
     lines = []
+    if expectation.is_total_count:
+        lines.append(
+            "- Return a single total count using COUNT(*) with no GROUP BY "
+            "(one row, one numeric column)."
+        )
     if expectation.entity_terms:
         lines.append(
             "- Include a human-readable entity identifier column. "
@@ -802,6 +1060,7 @@ Rules:
 - Prefer explicit columns over SELECT *.
 - If the user asks to list entities and a join is only needed for filtering, prefer DISTINCT entity rows over repeated transaction rows.
 - If the user asks for top N, first N, or a specific row count, use that LIMIT. Otherwise add LIMIT {max_result_rows} for detailed row queries.
+- If the user asks for a total count, return a single COUNT(*) aggregate row. Do not GROUP BY unless the user asks for a breakdown by a dimension.
 - Return only SQL. Do not use markdown fences.
 Expected result shape:
 {shape_expectation_text(expectation)}
@@ -822,6 +1081,7 @@ SQL_REPAIR_RULES = """Rules:
 - Use explicit JOIN conditions.
 - If the user asks to list entities and a join is only needed for filtering, prefer DISTINCT entity rows over repeated transaction rows.
 - If the user asks for top N, first N, or a specific row count, use that LIMIT. Otherwise add LIMIT {max_result_rows} for detailed row queries.
+- If the user asks for a total count, return a single COUNT(*) aggregate row. Do not GROUP BY unless the user asks for a breakdown by a dimension.
 - Do not use comments or prohibited operations."""
 
 
@@ -1080,6 +1340,14 @@ def has_order_by(sql: str) -> bool:
     return parsed.find(exp.Order) is not None
 
 
+def has_group_by(sql: str) -> bool:
+    try:
+        parsed = sqlglot.parse_one(sql, read="sqlite")
+    except sqlglot.errors.ParseError:
+        return False
+    return parsed.find(exp.Group) is not None
+
+
 def execute_readonly_query(
     db_path: Path,
     sql: str,
@@ -1170,6 +1438,7 @@ def check_result_shape(
         "column_types": column_types,
         "row_count": len(rows),
         "has_order_by": has_order_by(sql),
+        "has_group_by": has_group_by(sql),
     }
     expected = {
         "entity_terms": list(expectation.entity_terms),
@@ -1178,8 +1447,18 @@ def check_result_shape(
         "order_direction": expectation.order_direction,
         "aggregate_kind": expectation.aggregate_kind,
         "expected_limit": expectation.expected_limit,
+        "is_total_count": expectation.is_total_count,
     }
     warnings: list[str] = []
+
+    if expectation.is_total_count and (
+        observed["has_group_by"] or len(rows) > 1 or len(columns) != 1
+    ):
+        warnings.append(
+            "the question asks for a single total count, but the SQL groups rows or returns "
+            "multiple rows/columns; use COUNT(*) without GROUP BY unless the user asks for a "
+            "breakdown"
+        )
 
     if expectation.entity_terms and columns:
         has_entity = any(
@@ -1570,10 +1849,10 @@ def answer_question(
     result = AnswerResult(question=question, retrieved_tables=[], expanded_tables=[])
     try:
         tables = extract_schema(settings.source_db_path)
-        documents = build_schema_documents(tables)
         auto_reindexed, freshness_warning = ensure_index_ready(settings, client, tables)
         result.auto_reindexed = auto_reindexed
         result.freshness_warning = freshness_warning
+        documents = load_indexed_documents(settings)
         retrieved = retrieve_schema(settings, client, question)
         result.retrieved_tables = [item.table_name for item in retrieved]
         expanded = expanded_schema_order(retrieved, tables)
@@ -1701,31 +1980,32 @@ def download_northwind(settings: Settings, *, force: bool = False) -> tuple[Path
 
 
 def verify_sqlite_database(path: Path) -> int:
-    """Validate that ``path`` is a readable SQLite database with user tables.
+    """Validate that ``path`` is a readable SQLite database with tables or views.
 
     Distinguishes the failure modes so the user gets an actionable message:
     a missing file, a file that is not a readable SQLite database, and a valid
-    but empty database are reported differently. Returns the user-table count.
+    but empty database are reported differently. Returns the count of user
+    tables and views (both are valid read sources since v2.4).
     """
     if not path.exists():
         raise AppError(f"Database not found: {path}")
     try:
         with sqlite3.connect(sqlite_readonly_uri(path), uri=True) as conn:
-            tables = [
+            objects = [
                 str(row[0])
                 for row in conn.execute(
                     """
                     SELECT name
                     FROM sqlite_master
-                    WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                    WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
                     """
                 )
             ]
     except sqlite3.Error as exc:
         raise AppError(f"Not a readable SQLite database: {path} ({exc})") from exc
-    if not tables:
-        raise AppError(f"No user tables found in SQLite database: {path}")
-    return len(tables)
+    if not objects:
+        raise AppError(f"No user tables or views found in SQLite database: {path}")
+    return len(objects)
 
 
 def verify_northwind_database(path: Path) -> int:

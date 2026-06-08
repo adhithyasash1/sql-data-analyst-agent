@@ -1,0 +1,13 @@
+{"question": "How many customers are there?", "expectation": "single total count; no GROUP BY"}
+{"question": "How many orders are there?", "expectation": "single total count; no GROUP BY"}
+{"question": "How many products exist?", "expectation": "single total count; no GROUP BY"}
+{"question": "What is the total number of employees?", "expectation": "single total count; no GROUP BY"}
+{"question": "Count the suppliers.", "expectation": "single total count; no GROUP BY"}
+{"question": "How many orders are there by ship country?", "expectation": "grouped count; one row per ship country"}
+{"question": "How many orders did each employee handle?", "expectation": "grouped count; one row per employee"}
+{"question": "Which customers placed the most orders?", "expectation": "ranked aggregate with ORDER BY"}
+{"question": "What are the top 5 products by quantity ordered?", "expectation": "ranked aggregate with ORDER BY and LIMIT 5"}
+{"question": "Which employees handled the most orders?", "expectation": "ranked aggregate with ORDER BY"}
+{"question": "What is the total freight by ship country?", "expectation": "aggregate grouped by ship country"}
+{"question": "Which suppliers provide the most products?", "expectation": "ranked aggregate with ORDER BY"}
+{"question": "List the 10 most recent orders.", "expectation": "detailed rows with ORDER BY order date and LIMIT 10"}

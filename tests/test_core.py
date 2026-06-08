@@ -15,6 +15,7 @@ from core import (
     SQL_REPAIR_RULES,
     SqlValidationError,
     answer_question,
+    build_schema_document,
     build_shape_repair_prompt,
     build_sql_prompt,
     build_validation_repair_prompt,
@@ -33,11 +34,13 @@ from core import (
     quote_identifier,
     read_query_logs,
     retrieve_schema,
+    schema_documents_for_index,
     schema_fingerprint,
     set_kv,
     setup_metadata,
     translate_model_error,
     validate_sql,
+    verify_sqlite_database,
 )
 from config import Settings, default_metadata_path_for_source
 
@@ -390,6 +393,7 @@ def test_retrieval_returns_schema_object(db_path: Path, tmp_path: Path) -> None:
         metadata_db_path=tmp_path / "metadata.db",
         embedding_batch_size=2,
         retrieval_top_k=2,
+        enable_schema_profiling=False,
     )
     try:
         index_schema(settings, FakeClient())  # type: ignore[arg-type]
@@ -611,6 +615,7 @@ def _answer_settings(db_path: Path, tmp_path: Path, **overrides: object) -> Sett
         embedding_batch_size=2,
         retrieval_top_k=4,
         enable_result_shape_check=False,
+        enable_schema_profiling=False,
     )
     base.update(overrides)
     return Settings(**base)
@@ -786,3 +791,237 @@ def test_embed_texts_translates_connection_error() -> None:
         embed_texts(_BoomClient(), "model", ["x"], 2, instruction="i")  # type: ignore[arg-type]
     assert "Could not reach the model server" in str(excinfo.value)
     assert "127.0.0.1:8000" in str(excinfo.value)
+
+
+# --- v2.2: total-count result shape ---------------------------------------------------
+
+
+def test_total_count_expectation_detection() -> None:
+    total = infer_shape_expectation("How many customers are there?")
+    assert total.is_total_count is True
+    assert total.entity_terms == ()  # the counted entity is aggregated, not a label column
+    assert infer_shape_expectation("Count the invoices.").is_total_count is True
+    assert infer_shape_expectation("What is the total number of customers?").is_total_count is True
+    assert infer_shape_expectation("What is the number of tracks?").is_total_count is True
+    # breakdown phrases turn a count into a grouped result, not a single total
+    assert infer_shape_expectation("How many customers are there by country?").is_total_count is False
+    assert infer_shape_expectation("Count orders per employee.").is_total_count is False
+    # ranked questions are not total counts
+    assert infer_shape_expectation("Which customers placed the most orders?").is_total_count is False
+
+
+def test_shape_check_flags_grouped_total_count() -> None:
+    check = check_result_shape(
+        "How many customers are there?",
+        "SELECT CustomerID, CompanyName, COUNT(*) AS CustomerCount "
+        "FROM Customers GROUP BY CustomerID",
+        ("CustomerID", "CompanyName", "CustomerCount"),
+        (("ALFKI", "Alfreds", 1), ("SAVEA", "Save-a-lot Markets", 1)),
+    )
+    assert check.ok is False
+    assert check.warning is not None
+    assert "total count" in check.warning
+
+
+def test_shape_check_allows_grouped_count_with_breakdown() -> None:
+    check = check_result_shape(
+        "How many customers are there by country?",
+        "SELECT Country, COUNT(*) AS CustomerCount FROM Customers GROUP BY Country",
+        ("Country", "CustomerCount"),
+        (("Germany", 11), ("USA", 13)),
+    )
+    assert check.ok is True
+    assert check.warning is None
+
+
+def test_answer_question_repairs_total_count_shape(db_path: Path, tmp_path: Path) -> None:
+    _require_loadable_sqlite_vec()
+    settings = _answer_settings(db_path, tmp_path, enable_result_shape_check=True)
+    client = FakeSqlClient(
+        [
+            "SELECT CustomerID, CompanyName, COUNT(*) AS CustomerCount "
+            "FROM Customers GROUP BY CustomerID",
+            "SELECT COUNT(*) AS CustomerCount FROM Customers",
+        ]
+    )
+    result = answer_question(settings, client, "How many customers are there?")  # type: ignore[arg-type]
+    assert result.success is True
+    assert result.repaired is True
+    assert result.repair_reason == "result shape mismatch"
+    assert result.columns == ("CustomerCount",)
+    assert result.rows == ((2,),)
+
+
+def test_prompts_include_total_count_rule() -> None:
+    expectation = infer_shape_expectation("How many customers are there?")
+    rule = "If the user asks for a total count, return a single COUNT(*) aggregate row."
+    initial = build_sql_prompt("How many customers are there?", "SCHEMA", 50, expectation)
+    validation = build_validation_repair_prompt(
+        "How many customers are there?", "SCHEMA", "BAD", "err", 50, expectation
+    )
+    shape = build_shape_repair_prompt("How many customers are there?", "SCHEMA", "SQL", {}, {}, 50)
+    assert rule in initial
+    assert rule in validation
+    assert rule in shape
+
+
+# --- v2.3: schema profiling -----------------------------------------------------------
+
+
+def test_schema_profile_includes_row_count_and_samples(db_path: Path, tmp_path: Path) -> None:
+    settings = Settings(
+        omlx_api_key="test",
+        db_path=db_path,
+        metadata_db_path=tmp_path / "metadata.db",
+        enable_schema_profiling=True,
+    )
+    docs = schema_documents_for_index(settings, extract_schema(db_path))
+    customers = next(doc for doc in docs if doc.table_name == "Customers")
+    assert "Profile" in customers.content
+    assert "Row count: 2" in customers.content
+    # sample values appear somewhere in the document (no row-order assumption)
+    assert "Alfreds" in customers.content
+
+
+def test_schema_profile_truncates_long_text(tmp_path: Path) -> None:
+    db = tmp_path / "long.db"
+    long_value = "x" * 200
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE Notes (NoteID INTEGER PRIMARY KEY, Body TEXT)")
+        conn.execute("INSERT INTO Notes VALUES (1, ?)", (long_value,))
+    settings = Settings(
+        omlx_api_key="test",
+        db_path=db,
+        metadata_db_path=tmp_path / "metadata.db",
+        enable_schema_profiling=True,
+        max_profile_text_length=20,
+    )
+    docs = schema_documents_for_index(settings, extract_schema(db))
+    notes = next(doc for doc in docs if doc.table_name == "Notes")
+    assert long_value not in notes.content
+    assert "x" * 20 + "…" in notes.content
+
+
+def test_schema_profile_skips_blob_columns(tmp_path: Path) -> None:
+    db = tmp_path / "blobs.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE Files (FileID INTEGER PRIMARY KEY, Data BLOB, Label TEXT)")
+        conn.execute("INSERT INTO Files VALUES (1, ?, 'first')", (b"\x00\x01\x02binary",))
+    settings = Settings(
+        omlx_api_key="test",
+        db_path=db,
+        metadata_db_path=tmp_path / "metadata.db",
+        enable_schema_profiling=True,
+    )
+    docs = schema_documents_for_index(settings, extract_schema(db))
+    files = next(doc for doc in docs if doc.table_name == "Files")
+    assert "Data: binary data (not profiled)" in files.content
+    assert "Data: samples" not in files.content  # the BLOB column is never sampled
+    assert "first" in files.content  # the text column is still profiled
+
+
+def test_disabling_schema_profiling_omits_profile(db_path: Path, tmp_path: Path) -> None:
+    settings = Settings(
+        omlx_api_key="test",
+        db_path=db_path,
+        metadata_db_path=tmp_path / "metadata.db",
+        enable_schema_profiling=False,
+    )
+    docs = schema_documents_for_index(settings, extract_schema(db_path))
+    assert all("Profile" not in doc.content for doc in docs)
+
+
+# --- v2.4: view support ---------------------------------------------------------------
+
+
+def create_view_db(path: Path) -> None:
+    with sqlite3.connect(path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE authors (
+                author_id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL
+            );
+            CREATE TABLE books (
+                book_id INTEGER PRIMARY KEY,
+                author_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                FOREIGN KEY (author_id) REFERENCES authors(author_id)
+            );
+            CREATE VIEW book_author_view AS
+                SELECT b.title, a.name AS author_name
+                FROM books b JOIN authors a ON b.author_id = a.author_id;
+            INSERT INTO authors VALUES (1, 'Ursula K. Le Guin');
+            INSERT INTO books VALUES (1, 1, 'A Wizard of Earthsea');
+            """
+        )
+
+
+def test_extract_schema_includes_views(tmp_path: Path) -> None:
+    db = tmp_path / "library.db"
+    create_view_db(db)
+    by_name = {table.name: table for table in extract_schema(db)}
+    assert "book_author_view" in by_name
+    assert by_name["book_author_view"].kind == "view"
+    assert by_name["books"].kind == "table"
+
+
+def test_view_schema_document_marks_view(tmp_path: Path) -> None:
+    db = tmp_path / "library.db"
+    create_view_db(db)
+    view = next(table for table in extract_schema(db) if table.name == "book_author_view")
+    content = build_schema_document(view).content
+    assert "Object type: view" in content
+    assert "View: book_author_view" in content
+
+
+def test_index_schema_indexes_views(tmp_path: Path) -> None:
+    _require_loadable_sqlite_vec()
+    db = tmp_path / "library.db"
+    create_view_db(db)
+    settings = Settings(
+        omlx_api_key="test",
+        db_path=db,
+        metadata_db_path=tmp_path / "metadata.db",
+        embedding_batch_size=2,
+        enable_schema_profiling=False,
+    )
+    summary = index_schema(settings, FakeClient())  # type: ignore[arg-type]
+    assert summary.table_count == 3
+    with metadata_connection(settings.metadata_path) as conn:
+        setup_metadata(conn)
+        kinds = dict(
+            conn.execute("SELECT object_name, object_type FROM schema_objects").fetchall()
+        )
+    assert kinds["book_author_view"] == "view"
+    assert kinds["books"] == "table"
+
+
+def test_validate_sql_allows_view_select(tmp_path: Path) -> None:
+    db = tmp_path / "library.db"
+    create_view_db(db)
+    schema = extract_schema(db)
+    validate_sql("SELECT title, author_name FROM book_author_view", schema)
+
+
+def test_validate_sql_rejects_drop_view(tmp_path: Path) -> None:
+    db = tmp_path / "library.db"
+    create_view_db(db)
+    schema = extract_schema(db)
+    with pytest.raises(SqlValidationError):
+        validate_sql("DROP VIEW book_author_view", schema)
+
+
+def test_verify_sqlite_database_accepts_view_only_database(tmp_path: Path) -> None:
+    db = tmp_path / "views_only.db"
+    with sqlite3.connect(db) as conn:
+        conn.executescript("CREATE VIEW answer_view AS SELECT 42 AS answer;")
+    assert verify_sqlite_database(db) == 1
+
+
+def test_verify_sqlite_database_rejects_empty_database(tmp_path: Path) -> None:
+    db = tmp_path / "empty.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("PRAGMA user_version = 1")
+    with pytest.raises(AppError, match="No user tables or views"):
+        verify_sqlite_database(db)

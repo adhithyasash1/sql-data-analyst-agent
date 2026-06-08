@@ -4,3 +4,7 @@ __pycache__/
 .pytest_cache/
 data/*.db
 data/*.db-*
+# Generated per-source schema indexes (sqlite-vec vectors, index state, query logs)
+data/metadata/
+# Local sample/test databases (not version-controlled, same as the default demo DB)
+data/test_dbs/

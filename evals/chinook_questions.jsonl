@@ -1,0 +1,13 @@
+{"question": "How many customers are there?", "expectation": "single total count; no GROUP BY"}
+{"question": "How many tracks are there?", "expectation": "single total count; no GROUP BY"}
+{"question": "What is the number of invoices?", "expectation": "single total count; no GROUP BY"}
+{"question": "Count the artists.", "expectation": "single total count; no GROUP BY"}
+{"question": "What is the total number of albums?", "expectation": "single total count; no GROUP BY"}
+{"question": "How many invoices are there per billing country?", "expectation": "grouped count; one row per billing country"}
+{"question": "How many tracks are in each genre?", "expectation": "grouped count; one row per genre"}
+{"question": "Which genres generated the most revenue?", "expectation": "ranked aggregate with ORDER BY"}
+{"question": "Which customers spent the most?", "expectation": "ranked aggregate with ORDER BY"}
+{"question": "What are the top 5 best-selling tracks?", "expectation": "ranked aggregate with ORDER BY and LIMIT 5"}
+{"question": "Which artists have the most albums?", "expectation": "ranked aggregate with ORDER BY"}
+{"question": "What is the total sales by billing country?", "expectation": "aggregate grouped by billing country"}
+{"question": "List the 10 most recent invoices.", "expectation": "detailed rows with ORDER BY invoice date and LIMIT 10"}

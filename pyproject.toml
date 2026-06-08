@@ -1,7 +1,7 @@
 [project]
-name = "northwind-text-to-sql"
-version = "0.1.0"
-description = "A local Text-to-SQL CLI for the Northwind SQLite database."
+name = "sql-data-analyst-agent"
+version = "0.2.4"
+description = "A local Text-to-SQL CLI for SQLite databases."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

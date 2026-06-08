@@ -49,6 +49,9 @@ class Settings(BaseSettings):
     enable_result_shape_check: bool = True
     enable_query_logging: bool = True
     require_sql_approval: bool = False
+    enable_schema_profiling: bool = True
+    max_profile_values: int = 3
+    max_profile_text_length: int = 80
 
     @field_validator(
         "retrieval_top_k",
@@ -57,6 +60,8 @@ class Settings(BaseSettings):
         "max_summary_tokens",
         "embedding_batch_size",
         "query_timeout_ms",
+        "max_profile_values",
+        "max_profile_text_length",
     )
     @classmethod
     def must_be_positive(cls, value: int) -> int:
