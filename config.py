@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     enable_schema_profiling: bool = True
     max_profile_values: int = 3
     max_profile_text_length: int = 80
+    enable_dataframe_analysis: bool = False
+    max_analysis_rows: int = 5000
+    max_analysis_columns: int = 30
+    output_dir: Path = Path("data/outputs")
 
     @field_validator(
         "retrieval_top_k",
@@ -62,6 +66,8 @@ class Settings(BaseSettings):
         "query_timeout_ms",
         "max_profile_values",
         "max_profile_text_length",
+        "max_analysis_rows",
+        "max_analysis_columns",
     )
     @classmethod
     def must_be_positive(cls, value: int) -> int:
@@ -93,6 +99,10 @@ class Settings(BaseSettings):
     @property
     def source_db_path(self) -> Path:
         return self.db_path.expanduser().resolve()
+
+    @property
+    def output_path(self) -> Path:
+        return self.output_dir.expanduser().resolve()
 
     @property
     def metadata_path(self) -> Path:

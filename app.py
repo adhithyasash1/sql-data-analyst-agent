@@ -16,16 +16,34 @@ from core import (
     AppError,
     NORTHWIND_DOWNLOAD_SHA,
     NORTHWIND_DOWNLOAD_URL,
+    ResultArtifact,
     answer_question,
+    artifact_describe_text,
+    artifact_preview_rows,
     create_openai_client,
     download_northwind,
+    export_artifact_csv,
     index_schema,
+    make_result_artifact,
+    parse_colon_command,
+    parse_count,
     read_query_logs,
     verify_sqlite_database,
 )
 
 app = typer.Typer(add_completion=False, help="Local Text-to-SQL for any SQLite database.")
 console = Console()
+
+ARTIFACT_HELP = """Artifact commands (operate on the last result):
+  :sql           Show the SQL for the last result
+  :columns       Show the result column names
+  :describe      Show a deterministic profile of the last result
+  :head [N]      Show the first N rows (default 10)
+  :tail [N]      Show the last N rows (default 10)
+  :export [csv]  Export the result to OUTPUT_DIR as CSV
+  :artifacts     List this session's results
+  :help          Show this help
+  :q             Quit"""
 
 
 def load_settings(db: Path | None = None, metadata_db: Path | None = None) -> Settings:
@@ -123,17 +141,28 @@ def ask(
 
     console.print(
         Panel.fit(
-            f"Database: {settings.source_db_path.name}\nType 'exit' to quit.",
+            f"Database: {settings.source_db_path.name}\n"
+            "Ask a question, or use :help for result commands. Type 'exit' to quit.",
             title="Text-to-SQL Assistant",
         )
     )
+    artifacts: list[ResultArtifact] = []
     while True:
         user_input = Prompt.ask("[bold]You[/bold]").strip()
-        if user_input.lower() in {"exit", "quit", ":q"}:
-            break
         if not user_input:
             continue
-        run_question(settings, client, user_input, verbose)
+        if user_input.lower() in {"exit", "quit"}:
+            break
+        command = parse_colon_command(user_input)
+        if command is not None:
+            name, arg = command
+            if name in {"q", "quit", "exit"}:
+                break
+            handle_artifact_command(name, arg, artifacts, settings, verbose)
+            continue
+        result = run_question(settings, client, user_input, verbose)
+        if result.success and result.sql and result.columns:
+            artifacts.append(make_result_artifact(len(artifacts) + 1, result))
 
 
 @app.command()
@@ -207,6 +236,86 @@ def run_question(settings: Settings, client, question: str, verbose: bool):
     return result
 
 
+def handle_artifact_command(
+    name: str,
+    arg: str,
+    artifacts: list[ResultArtifact],
+    settings: Settings,
+    verbose: bool,
+) -> None:
+    if name == "help":
+        console.print(Panel(ARTIFACT_HELP, title="Help"))
+        return
+    if name == "artifacts":
+        render_artifacts(artifacts)
+        return
+    if not artifacts:
+        console.print("No result yet — ask a question first.")
+        return
+    last = artifacts[-1]
+    if name == "sql":
+        console.print(Panel(Syntax(last.sql, "sql", theme="monokai", word_wrap=True), title="SQL"))
+    elif name == "columns":
+        console.print(Panel("\n".join(last.columns) or "none", title="Columns"))
+    elif name == "describe":
+        try:
+            console.print(Panel(artifact_describe_text(settings, last), title="Analysis"))
+        except AppError as exc:
+            console.print(Panel(str(exc), title="Analysis unavailable", border_style="yellow"))
+    elif name in {"head", "tail"}:
+        try:
+            count = parse_count(arg)
+        except AppError as exc:
+            console.print(Panel(str(exc), title="Invalid count", border_style="yellow"))
+            return
+        render_rows(last.columns, artifact_preview_rows(last, name, count), truncated=False)
+    elif name == "export":
+        if arg not in {"", "csv"}:
+            console.print(
+                Panel(
+                    "Only CSV export is supported currently. Use :export csv.",
+                    title="Unsupported export",
+                    border_style="yellow",
+                )
+            )
+            return
+        try:
+            export = export_artifact_csv(settings, last, settings.output_path)
+        except AppError as exc:
+            console.print(Panel(str(exc), title="Export failed", border_style="yellow"))
+            return
+        console.print(f"[green]Exported[/green] {export.row_count} rows to {export.path}")
+        if export.truncated:
+            console.print(
+                f"[yellow]Export was capped at MAX_ANALYSIS_ROWS={settings.max_analysis_rows}; "
+                "more rows may exist.[/yellow]"
+            )
+    else:
+        console.print(Panel(ARTIFACT_HELP, title=f"Unknown command :{name}"))
+
+
+def render_artifacts(artifacts: list[ResultArtifact]) -> None:
+    if not artifacts:
+        console.print("No artifacts yet.")
+        return
+    table = Table(title=f"{len(artifacts)} session artifact(s)")
+    table.add_column("ID", justify="right")
+    table.add_column("Rows", justify="right")
+    table.add_column("Truncated")
+    table.add_column("Question")
+    table.add_column("SQL")
+    for artifact in artifacts:
+        sql = artifact.sql if len(artifact.sql) <= 60 else artifact.sql[:57] + "..."
+        table.add_row(
+            str(artifact.artifact_id),
+            str(len(artifact.rows)),
+            "yes" if artifact.truncated else "no",
+            preview(artifact.question, 50),
+            sql,
+        )
+    console.print(table)
+
+
 def render_answer(result, verbose: bool) -> None:
     if result.error_message and not result.success:
         console.print(Panel(result.error_message, title="Error", border_style="red"))
@@ -224,6 +333,12 @@ def render_answer(result, verbose: bool) -> None:
         console.print(Panel(Syntax(result.sql, "sql", theme="monokai", word_wrap=True), title="Generated SQL"))
 
     render_rows(result.columns, result.rows, result.truncated)
+    if result.analysis_text:
+        console.print(Panel(result.analysis_text, title="Analysis", border_style="cyan"))
+    if result.analysis_error:
+        console.print(
+            Panel(result.analysis_error, title="Analysis unavailable", border_style="yellow")
+        )
     if result.summary:
         console.print(Panel(result.summary, title="Summary", border_style="green"))
 
@@ -238,6 +353,7 @@ def render_answer(result, verbose: bool) -> None:
             f"completion={result.token_usage.completion_tokens}, total={result.token_usage.total_tokens}",
             f"Shape expected: {result.shape_expected}",
             f"Shape observed: {result.shape_observed}",
+            f"Analysis: {result.analysis_text or result.analysis_error or 'disabled'}",
         ]
         console.print(Panel("\n".join(diagnostics), title="Diagnostics"))
 

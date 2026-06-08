@@ -1,7 +1,7 @@
 [project]
 name = "sql-data-analyst-agent"
-version = "0.2.4"
-description = "A local Text-to-SQL CLI for SQLite databases."
+version = "0.3.1"
+description = "A local Text-to-SQL CLI for SQLite databases with optional dataframe result analysis."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -11,6 +11,12 @@ dependencies = [
     "sqlglot>=26.0.0",
     "sqlite-vec>=0.1.9",
     "typer>=0.16.0",
+]
+
+[project.optional-dependencies]
+analysis = [
+    "pandas>=2.0.0",
+    "pyarrow>=15.0.0",
 ]
 
 [dependency-groups]

@@ -80,6 +80,31 @@ Start the interactive assistant:
 uv run python app.py ask --db data/your.db
 ```
 
+#### Interactive commands
+
+Inside the interactive assistant, the last successful result is kept as an in-session
+**artifact** you can inspect and export with deterministic colon-commands (no model call, no
+generated code):
+
+| Command | Action |
+| --- | --- |
+| `:sql` | Show the SQL for the last result |
+| `:columns` | Show the result column names |
+| `:describe` | Show a deterministic profile (shape, dtypes, null/distinct, numeric min/max/mean) |
+| `:head [N]` | Show the first N rows (default 10) |
+| `:tail [N]` | Show the last N rows (default 10) |
+| `:export [csv]` | Export the result to `OUTPUT_DIR` as CSV |
+| `:artifacts` | List this session's results |
+| `:help` | Show this help |
+| `:q` / `exit` / `quit` | Quit |
+
+These work in interactive mode only. **Artifacts are in-memory and last only for the current
+session; only exported CSV files persist.** `:describe` recomputes from the stored rows when
+`ENABLE_DATAFRAME_ANALYSIS` was off, so it needs the `analysis` extra in that case. `:export csv`
+does a bounded read-only re-fetch up to `MAX_ANALYSIS_ROWS` when the displayed result was
+truncated (it reuses the validated SQL through the read-only executor; no extra required), and
+reports the exact row count and whether the export was capped.
+
 Ask one question and exit:
 
 ```bash
@@ -117,12 +142,22 @@ Important settings in `.env`:
 - `ENABLE_SCHEMA_PROFILING`: adds bounded row counts and sample values to schema documents, default `true`. Set `false` to skip profiling.
 - `MAX_PROFILE_VALUES`: sample values collected per column during profiling, default `3`.
 - `MAX_PROFILE_TEXT_LENGTH`: maximum characters kept per sampled text value, default `80`.
+- `ENABLE_DATAFRAME_ANALYSIS`: opt-in deterministic result analysis (needs the `analysis` extra), default `false`.
+- `MAX_ANALYSIS_ROWS`: row cap for the analysis fetch when displayed rows were truncated, default `5000`.
+- `MAX_ANALYSIS_COLUMNS`: maximum columns rendered in the analysis panel / summary grounding, default `30`.
+- `OUTPUT_DIR`: directory for interactive `:export` CSV files, default `data/outputs` (gitignored).
 
 If only row data changes while table schema is unchanged, the app warns but does not reindex. If table schema changes, `ask` auto-reindexes before answering when `AUTO_REINDEX=true`.
 
 ### Schema profiling
 
 Schema profiling adds bounded row counts and sample values to table/view-level schema documents to improve SQL generation on unfamiliar databases. It can be disabled with `ENABLE_SCHEMA_PROFILING=false`. Profiling reads only through the read-only SQLite connection and never modifies the source database; profiles are built at index time and refreshed whenever the schema or profiling settings change. Views are profiled lightly (sample values only; no `COUNT(*)` or `MIN`/`MAX`).
+
+### Result analysis
+
+When `ENABLE_DATAFRAME_ANALYSIS=true`, a successful result is turned into a `pyarrow.Table` and a pandas DataFrame, and a deterministic profile is computed: shape, per-column dtype, null and distinct counts, and numeric min/max/mean. The profile is shown in an **Analysis** panel and, when `ENABLE_LLM_SUMMARY=true`, grounds the narrative summary. No model-generated code runs — only deterministic profiling over already-validated, read-only result rows. The Arrow table is an ADBC-ready substrate for a future multi-database backend.
+
+Install the optional dependencies once with `uv sync --extra analysis` (pandas + pyarrow), then run normally (`ENABLE_DATAFRAME_ANALYSIS=true uv run python app.py ask ...`); `uv run --extra analysis python app.py ...` works as a one-shot alternative. The feature is off by default, and if it is enabled without the extra installed the answer still succeeds with a notice. **Note:** if displayed rows were truncated at `MAX_RESULT_ROWS`, analysis performs one additional bounded read-only fetch up to `MAX_ANALYSIS_ROWS`; if the result still exceeds that cap, the profile (and grounded summary) describe that capped subset and say so.
 
 ## Safety Boundaries
 
@@ -154,6 +189,7 @@ Schema profiling adds bounded row counts and sample values to table/view-level s
 - No live oMLX integration tests are included.
 - No full prompt or result-row logging is implemented.
 - Result-shape checks are conservative heuristics and may warn on valid answers.
+- Result analysis is descriptive (profiling), not inferential, and runs no model-generated code.
 
 ## Sources
 

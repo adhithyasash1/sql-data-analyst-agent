@@ -8,3 +8,5 @@ data/*.db-*
 data/metadata/
 # Local sample/test databases (not version-controlled, same as the default demo DB)
 data/test_dbs/
+# Exported result CSVs from interactive :export
+data/outputs/

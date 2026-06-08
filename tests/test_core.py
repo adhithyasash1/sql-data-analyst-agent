@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,27 +13,40 @@ from core import (
     AnswerResult,
     AppError,
     IndexStateError,
+    ResultArtifact,
     SQL_REPAIR_RULES,
     SqlValidationError,
+    analyze_execution,
     answer_question,
+    artifact_describe_text,
+    artifact_preview_rows,
     build_schema_document,
     build_shape_repair_prompt,
+    build_summary_payload,
     build_sql_prompt,
     build_validation_repair_prompt,
     check_result_shape,
+    dataframe_profile_text,
     deterministic_summary,
     embed_texts,
     execute_readonly_query,
+    export_artifact_csv,
     extract_schema,
     extract_sql,
     get_kv,
     infer_shape_expectation,
     index_schema,
     log_query,
+    make_result_artifact,
+    make_unique_column_names,
     metadata_connection,
+    parse_colon_command,
+    parse_count,
+    profile_result_dataframe,
     quote_guidance,
     quote_identifier,
     read_query_logs,
+    result_to_arrow_table,
     retrieve_schema,
     schema_documents_for_index,
     schema_fingerprint,
@@ -1010,6 +1024,304 @@ def test_validate_sql_rejects_drop_view(tmp_path: Path) -> None:
     schema = extract_schema(db)
     with pytest.raises(SqlValidationError):
         validate_sql("DROP VIEW book_author_view", schema)
+
+
+# --- v3.0: deterministic result analysis ----------------------------------------------
+
+
+def test_make_unique_column_names() -> None:
+    assert make_unique_column_names(("count", "count", "x")) == ("count", "count__2", "x")
+
+
+def test_result_to_arrow_table_basic() -> None:
+    pytest.importorskip("pyarrow")
+    pytest.importorskip("pandas")
+    table = result_to_arrow_table(("id", "name"), ((1, "a"), (2, "b")))
+    assert table.num_rows == 2
+    assert table.column_names == ["id", "name"]
+
+
+def test_result_to_arrow_table_mixed_types_fall_back_to_string() -> None:
+    pytest.importorskip("pyarrow")
+    pytest.importorskip("pandas")
+    # SQLite is dynamically typed: a column may hold int + str; it must fall back to string
+    # with None preserved as null (not the literal "None").
+    table = result_to_arrow_table(("mixed",), ((1,), ("two",), (None,)))
+    assert table.column(0).to_pylist() == ["1", "two", None]
+
+
+def test_result_to_arrow_table_duplicate_names_do_not_crash() -> None:
+    pytest.importorskip("pyarrow")
+    pytest.importorskip("pandas")
+    table = result_to_arrow_table(("count", "count"), ((1, 2),))
+    assert table.num_rows == 1
+    assert table.num_columns == 2
+
+
+def test_profile_result_dataframe_computes_stats() -> None:
+    pytest.importorskip("pyarrow")
+    pytest.importorskip("pandas")
+    profile = profile_result_dataframe(
+        ("country", "total"),
+        (("USA", 10), ("France", 20), ("USA", None)),
+    )
+    assert profile.row_count == 3
+    assert profile.column_count == 2
+    by_name = {stat.name: stat for stat in profile.columns}
+    assert by_name["country"].distinct_count == 2
+    assert by_name["country"].null_count == 0
+    total = by_name["total"]
+    assert total.null_count == 1
+    assert total.minimum == 10
+    assert total.maximum == 20
+    assert total.mean == pytest.approx(15.0)
+
+
+def test_profile_result_dataframe_handles_empty_result() -> None:
+    pytest.importorskip("pyarrow")
+    pytest.importorskip("pandas")
+    profile = profile_result_dataframe(("CustomerID", "CompanyName"), ())
+    assert profile.row_count == 0
+    assert profile.column_count == 2
+    for stat in profile.columns:
+        assert stat.null_count == 0
+        assert stat.distinct_count == 0
+
+
+def test_dataframe_profile_text_caps_columns() -> None:
+    pytest.importorskip("pyarrow")
+    pytest.importorskip("pandas")
+    columns = tuple(f"c{index}" for index in range(5))
+    profile = profile_result_dataframe(columns, (tuple(range(5)),))
+    text = dataframe_profile_text(profile, max_columns=2)
+    assert "Rows profiled: 1" in text
+    assert "... 3 more columns omitted" in text
+
+
+def test_build_summary_payload_includes_profile_when_present() -> None:
+    payload = build_summary_payload(
+        "q", "SELECT 1", ("n",), ((1,),), False, analysis_text="Rows profiled: 1, Columns: 1"
+    )
+    assert "Deterministic result profile" in payload
+    assert "do not invent rows or columns" in payload
+    assert "Rows profiled: 1, Columns: 1" in payload
+
+
+def test_build_summary_payload_omits_profile_when_absent() -> None:
+    payload = build_summary_payload("q", "SELECT 1", ("n",), ((1,),), False)
+    assert "Deterministic result profile" not in payload
+    assert payload.rstrip().endswith("Summary:")
+
+
+def _analysis_settings(db_path: Path, tmp_path: Path) -> Settings:
+    return Settings(
+        omlx_api_key="test",
+        db_path=db_path,
+        metadata_db_path=tmp_path / "metadata.db",
+        enable_dataframe_analysis=True,
+        max_analysis_rows=10,
+    )
+
+
+def test_analyze_execution_reuses_untruncated_rows(db_path: Path, tmp_path: Path) -> None:
+    pytest.importorskip("pyarrow")
+    pytest.importorskip("pandas")
+    settings = _analysis_settings(db_path, tmp_path)
+    sql = "SELECT OrderID FROM Orders ORDER BY OrderID"
+    execution = execute_readonly_query(db_path, sql, max_rows=10, timeout_ms=3000)
+    assert execution.truncated is False
+    profile, text = analyze_execution(settings, sql, execution)
+    assert profile.row_count == 3
+    assert profile.profiled_truncated is False
+    assert "Rows profiled: 3" in text
+
+
+def test_analyze_execution_refetches_when_truncated(db_path: Path, tmp_path: Path) -> None:
+    pytest.importorskip("pyarrow")
+    pytest.importorskip("pandas")
+    settings = _analysis_settings(db_path, tmp_path)
+    sql = "SELECT OrderID FROM Orders ORDER BY OrderID"
+    execution = execute_readonly_query(db_path, sql, max_rows=2, timeout_ms=3000)
+    assert execution.truncated is True and len(execution.rows) == 2
+    profile, _ = analyze_execution(settings, sql, execution)
+    assert profile.row_count == 3  # re-fetched beyond the display cap
+
+
+def test_answer_question_populates_analysis_when_enabled(db_path: Path, tmp_path: Path) -> None:
+    _require_loadable_sqlite_vec()
+    pytest.importorskip("pyarrow")
+    pytest.importorskip("pandas")
+    settings = _answer_settings(db_path, tmp_path, enable_dataframe_analysis=True)
+    client = FakeSqlClient(["SELECT CompanyName FROM Customers ORDER BY CompanyName"])
+    result = answer_question(settings, client, "Which customers do we have?")  # type: ignore[arg-type]
+    assert result.success is True
+    assert result.analysis is not None
+    assert result.analysis_error is None
+    assert result.analysis_text and "Rows profiled:" in result.analysis_text
+
+
+def test_answer_question_skips_analysis_when_disabled(db_path: Path, tmp_path: Path) -> None:
+    _require_loadable_sqlite_vec()
+    settings = _answer_settings(db_path, tmp_path)  # enable_dataframe_analysis defaults False
+    client = FakeSqlClient(["SELECT CompanyName FROM Customers ORDER BY CompanyName"])
+    result = answer_question(settings, client, "Which customers do we have?")  # type: ignore[arg-type]
+    assert result.success is True
+    assert result.analysis is None
+    assert result.analysis_text is None
+
+
+def test_answer_question_analysis_failure_is_non_fatal(
+    db_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _require_loadable_sqlite_vec()
+    settings = _answer_settings(db_path, tmp_path, enable_dataframe_analysis=True)
+
+    def boom(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr("core.analyze_execution", boom)
+    client = FakeSqlClient(["SELECT CompanyName FROM Customers ORDER BY CompanyName"])
+    result = answer_question(settings, client, "Which customers do we have?")  # type: ignore[arg-type]
+    assert result.success is True
+    assert result.analysis is None
+    assert result.analysis_error is not None and "kaboom" in result.analysis_error
+
+
+# --- v3.1: interactive result artifacts + colon commands -------------------------------
+
+
+def _make_artifact(rows: tuple[tuple[object, ...], ...], **overrides: object) -> ResultArtifact:
+    base: dict[str, object] = dict(
+        artifact_id=1,
+        question="q",
+        sql="SELECT x FROM t",
+        columns=("x",),
+        rows=rows,
+        truncated=False,
+        analysis_text=None,
+        created_at="2026-06-08T00:00:00+00:00",
+    )
+    base.update(overrides)
+    return ResultArtifact(**base)  # type: ignore[arg-type]
+
+
+def test_parse_colon_command_variants() -> None:
+    assert parse_colon_command(":head 5") == ("head", "5")
+    assert parse_colon_command(":export csv") == ("export", "csv")
+    assert parse_colon_command(":describe") == ("describe", "")
+    assert parse_colon_command(":head    5") == ("head", "5")  # collapses extra spaces
+    assert parse_colon_command("list customers") is None
+    assert parse_colon_command(":") is None
+    assert parse_colon_command("   ") is None
+
+
+def test_parse_count_rules() -> None:
+    assert parse_count("") == 10
+    assert parse_count("5") == 5
+    for bad in ("abc", "0", "-3"):
+        with pytest.raises(AppError):
+            parse_count(bad)
+
+
+def test_make_result_artifact_copies_fields() -> None:
+    result = AnswerResult(question="hello", retrieved_tables=[], expanded_tables=[])
+    result.sql = "SELECT a FROM t"
+    result.columns = ("a",)
+    result.rows = ((1,),)
+    result.truncated = True
+    result.analysis_text = "Rows profiled: 1, Columns: 1"
+    artifact = make_result_artifact(3, result)
+    assert artifact.artifact_id == 3
+    assert artifact.question == "hello"
+    assert artifact.sql == "SELECT a FROM t"
+    assert artifact.columns == ("a",)
+    assert artifact.rows == ((1,),)
+    assert artifact.truncated is True
+    assert artifact.analysis_text == "Rows profiled: 1, Columns: 1"
+    assert artifact.created_at
+
+
+def test_make_result_artifact_requires_sql_and_columns() -> None:
+    result = AnswerResult(question="q", retrieved_tables=[], expanded_tables=[])
+    with pytest.raises(AppError):
+        make_result_artifact(1, result)  # no SQL
+    result.sql = "SELECT a FROM t"
+    with pytest.raises(AppError):
+        make_result_artifact(1, result)  # no columns
+
+
+def test_artifact_preview_rows_head_tail() -> None:
+    artifact = _make_artifact(tuple((index,) for index in range(5)))
+    assert artifact_preview_rows(artifact, "head", 2) == ((0,), (1,))
+    assert artifact_preview_rows(artifact, "tail", 2) == ((3,), (4,))
+    assert artifact_preview_rows(artifact, "head", 99) == artifact.rows
+    assert artifact_preview_rows(artifact, "tail", 1) == ((4,),)
+    with pytest.raises(AppError):
+        artifact_preview_rows(artifact, "middle", 2)
+
+
+def test_export_artifact_csv_writes_sequential_sanitized_files(tmp_path: Path) -> None:
+    settings = Settings(
+        omlx_api_key="test",
+        db_path=tmp_path / "x.db",
+        metadata_db_path=tmp_path / "m.db",
+        output_dir=tmp_path / "outputs",
+    )
+    artifact = _make_artifact(
+        ((1, "a"), (2, None), (3, b"\x00bin")),
+        sql="SELECT id, name FROM t",
+        columns=("id", "name"),
+    )
+    export = export_artifact_csv(settings, artifact, settings.output_path)
+    assert export.path.name == "result_001.csv"
+    assert export.truncated is False
+    assert export.row_count == 3
+    with export.path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.reader(handle))
+    assert rows[0] == ["id", "name"]
+    assert rows[1] == ["1", "a"]
+    assert rows[2] == ["2", ""]  # None -> empty cell
+    assert rows[3] == ["3", "<binary>"]  # bytes -> <binary>
+    second = export_artifact_csv(settings, artifact, settings.output_path)
+    assert second.path.name == "result_002.csv"  # sequential, no overwrite
+
+
+def test_export_artifact_csv_refetches_when_truncated(db_path: Path, tmp_path: Path) -> None:
+    settings = Settings(
+        omlx_api_key="test",
+        db_path=db_path,
+        metadata_db_path=tmp_path / "m.db",
+        output_dir=tmp_path / "outputs",
+        max_analysis_rows=10,
+    )
+    sql = "SELECT OrderID FROM Orders ORDER BY OrderID"
+    execution = execute_readonly_query(db_path, sql, max_rows=2, timeout_ms=3000)
+    assert execution.truncated is True
+    artifact = _make_artifact(
+        execution.rows, sql=sql, columns=execution.columns, truncated=True
+    )
+    export = export_artifact_csv(settings, artifact, settings.output_path)
+    assert export.row_count == 3  # re-fetched all 3 orders beyond the display cap
+    assert export.truncated is False
+    with export.path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.reader(handle))
+    assert rows[0] == ["OrderID"]
+    assert len(rows) == 4  # header + 3 rows
+
+
+def test_artifact_describe_text_reuses_analysis_text() -> None:
+    artifact = _make_artifact(((1,),), analysis_text="Rows profiled: 1, Columns: 1")
+    settings = Settings(omlx_api_key="test")
+    assert artifact_describe_text(settings, artifact) == "Rows profiled: 1, Columns: 1"
+
+
+def test_artifact_describe_text_computes_when_missing() -> None:
+    pytest.importorskip("pyarrow")
+    pytest.importorskip("pandas")
+    artifact = _make_artifact(((10,), (20,)), sql="SELECT total FROM t", columns=("total",))
+    settings = Settings(omlx_api_key="test")
+    text = artifact_describe_text(settings, artifact)
+    assert "Rows profiled: 2" in text
 
 
 def test_verify_sqlite_database_accepts_view_only_database(tmp_path: Path) -> None:

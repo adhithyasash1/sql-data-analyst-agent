@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import os
@@ -152,6 +153,44 @@ class ExecutionResult:
 
 
 @dataclass(frozen=True)
+class ColumnStat:
+    name: str
+    dtype: str
+    null_count: int
+    distinct_count: int
+    minimum: float | None = None
+    maximum: float | None = None
+    mean: float | None = None
+
+
+@dataclass(frozen=True)
+class DataFrameProfile:
+    row_count: int
+    column_count: int
+    columns: tuple[ColumnStat, ...]
+    profiled_truncated: bool = False
+
+
+@dataclass(frozen=True)
+class ResultArtifact:
+    artifact_id: int
+    question: str
+    sql: str
+    columns: tuple[str, ...]
+    rows: tuple[tuple[Any, ...], ...]
+    truncated: bool
+    analysis_text: str | None
+    created_at: str
+
+
+@dataclass(frozen=True)
+class ExportResult:
+    path: Path
+    row_count: int
+    truncated: bool
+
+
+@dataclass(frozen=True)
 class ShapeExpectation:
     entity_terms: tuple[str, ...] = ()
     requires_numeric: bool = False
@@ -207,6 +246,9 @@ class AnswerResult:
     token_usage: UsageStats = field(default_factory=UsageStats)
     auto_reindexed: bool = False
     freshness_warning: str | None = None
+    analysis: DataFrameProfile | None = None
+    analysis_text: str | None = None
+    analysis_error: str | None = None
 
 
 def utc_now() -> str:
@@ -1617,15 +1659,282 @@ def format_value(value: Any) -> str:
     return str(value)
 
 
-def generate_llm_summary(
-    client: OpenAI,
-    settings: Settings,
+def _require_dataframe_libs() -> tuple[Any, Any]:
+    """Lazy-import pyarrow + pandas, raising a friendly error naming the optional extra."""
+    try:
+        import pandas as pd
+        import pyarrow as pa
+    except ImportError as exc:
+        raise AppError(
+            "Result analysis needs the optional analysis extra. "
+            "Install it with: uv sync --extra analysis"
+        ) from exc
+    return pa, pd
+
+
+def make_unique_column_names(columns: tuple[str, ...]) -> tuple[str, ...]:
+    """De-duplicate column names for the internal Arrow/pandas frame.
+
+    Original display names are kept elsewhere (ColumnStat.name); this only protects the
+    Arrow table / pandas conversion from duplicate result columns, e.g.
+    ("count", "count") -> ("count", "count__2").
+    """
+    seen: dict[str, int] = {}
+    unique: list[str] = []
+    for name in columns:
+        if name in seen:
+            seen[name] += 1
+            unique.append(f"{name}__{seen[name]}")
+        else:
+            seen[name] = 1
+            unique.append(name)
+    return tuple(unique)
+
+
+def result_to_arrow_table(columns: tuple[str, ...], rows: tuple[tuple[Any, ...], ...]) -> Any:
+    """Build a pyarrow.Table from a validated result, column by column.
+
+    SQLite is dynamically typed, so a column can hold mixed types; on a type-inference
+    failure that column falls back to a string array with NULLs preserved as null.
+    """
+    pa, _ = _require_dataframe_libs()
+    names = make_unique_column_names(columns)
+    arrays = []
+    for index in range(len(columns)):
+        values = [row[index] for row in rows]
+        try:
+            arrays.append(pa.array(values))
+        except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError):
+            arrays.append(
+                pa.array(
+                    [None if value is None else str(value) for value in values],
+                    type=pa.string(),
+                )
+            )
+    return pa.Table.from_arrays(arrays, names=list(names))
+
+
+def _profile_number(value: Any) -> float | None:
+    """Coerce a numeric stat to a plain float, dropping NaN (NaN != NaN)."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if number != number else number
+
+
+def profile_result_dataframe(
+    columns: tuple[str, ...],
+    rows: tuple[tuple[Any, ...], ...],
+    profiled_truncated: bool = False,
+) -> DataFrameProfile:
+    """Compute a deterministic per-column profile via pyarrow -> pandas."""
+    _, _pd = _require_dataframe_libs()
+    from pandas.api.types import is_numeric_dtype
+
+    frame = result_to_arrow_table(columns, rows).to_pandas()
+    stats: list[ColumnStat] = []
+    for index, name in enumerate(columns):
+        series = frame.iloc[:, index]
+        null_count = int(series.isna().sum())
+        distinct_count = int(series.nunique(dropna=True))
+        minimum = maximum = mean = None
+        if is_numeric_dtype(series) and null_count < len(series):
+            minimum = _profile_number(series.min())
+            maximum = _profile_number(series.max())
+            mean = _profile_number(series.mean())
+        stats.append(
+            ColumnStat(
+                name=name,
+                dtype=str(series.dtype),
+                null_count=null_count,
+                distinct_count=distinct_count,
+                minimum=minimum,
+                maximum=maximum,
+                mean=mean,
+            )
+        )
+    return DataFrameProfile(
+        row_count=int(len(frame)),
+        column_count=len(columns),
+        columns=tuple(stats),
+        profiled_truncated=profiled_truncated,
+    )
+
+
+def _format_stat_number(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    rounded = round(value, 4)
+    return str(int(rounded)) if rounded == int(rounded) else str(rounded)
+
+
+def dataframe_profile_text(profile: DataFrameProfile, max_columns: int) -> str:
+    """Render a compact, deterministic, column-capped profile for panel + LLM grounding."""
+    lead = f"Rows profiled: {profile.row_count}, Columns: {profile.column_count}"
+    if profile.profiled_truncated:
+        lead += " (analysis row cap reached; more rows may exist)"
+    lines = [lead]
+    shown = profile.columns[:max_columns]
+    for stat in shown:
+        parts = [
+            f"- {stat.name}: {stat.dtype}",
+            f"nulls={stat.null_count}",
+            f"distinct={stat.distinct_count}",
+        ]
+        if stat.minimum is not None or stat.maximum is not None or stat.mean is not None:
+            parts.append(f"min={_format_stat_number(stat.minimum)}")
+            parts.append(f"max={_format_stat_number(stat.maximum)}")
+            parts.append(f"mean={_format_stat_number(stat.mean)}")
+        lines.append(", ".join(parts))
+    omitted = profile.column_count - len(shown)
+    if omitted > 0:
+        lines.append(f"... {omitted} more columns omitted")
+    return "\n".join(lines)
+
+
+def analyze_execution(
+    settings: Settings, sql: str, execution: ExecutionResult
+) -> tuple[DataFrameProfile, str]:
+    """Profile a successful result. Reuses the displayed rows unless they were truncated,
+    in which case it performs one bounded, read-only re-fetch up to max_analysis_rows.
+    """
+    columns, rows = execution.columns, execution.rows
+    profiled_truncated = execution.truncated
+    if execution.truncated and settings.max_analysis_rows > len(rows):
+        bigger = execute_readonly_query(
+            settings.source_db_path,
+            sql,
+            max_rows=settings.max_analysis_rows,
+            timeout_ms=settings.query_timeout_ms,
+        )
+        columns, rows = bigger.columns, bigger.rows
+        profiled_truncated = bigger.truncated
+    profile = profile_result_dataframe(columns, rows, profiled_truncated=profiled_truncated)
+    return profile, dataframe_profile_text(profile, settings.max_analysis_columns)
+
+
+def make_result_artifact(artifact_id: int, result: AnswerResult) -> ResultArtifact:
+    """Snapshot a successful result for in-session reuse. Defends itself even though the
+    interactive loop only calls it for successful results with SQL and columns."""
+    if not result.sql:
+        raise AppError("Cannot create an artifact without SQL.")
+    if not result.columns:
+        raise AppError("Cannot create an artifact without result columns.")
+    return ResultArtifact(
+        artifact_id=artifact_id,
+        question=result.question,
+        sql=result.sql,
+        columns=result.columns,
+        rows=result.rows,
+        truncated=result.truncated,
+        analysis_text=result.analysis_text,
+        created_at=utc_now(),
+    )
+
+
+def parse_colon_command(text: str) -> tuple[str, str] | None:
+    """Parse a ``:command [arg]`` line. Returns ``(name_lower, arg)`` or None for non-commands."""
+    stripped = text.strip()
+    if not stripped.startswith(":"):
+        return None
+    body = stripped[1:].strip()
+    if not body:
+        return None
+    name, _, arg = body.partition(" ")
+    return name.lower(), arg.strip()
+
+
+def parse_count(arg: str, default: int = 10) -> int:
+    """Parse a positive row count for :head/:tail; reject bad input rather than silently default."""
+    if not arg:
+        return default
+    try:
+        value = int(arg)
+    except ValueError as exc:
+        raise AppError("Count must be a positive integer.") from exc
+    if value < 1:
+        raise AppError("Count must be at least 1.")
+    return value
+
+
+def artifact_preview_rows(
+    artifact: ResultArtifact, mode: str, n: int
+) -> tuple[tuple[Any, ...], ...]:
+    if mode not in {"head", "tail"}:
+        raise AppError("Preview mode must be 'head' or 'tail'.")
+    count = max(1, n)
+    return artifact.rows[-count:] if mode == "tail" else artifact.rows[:count]
+
+
+def artifact_describe_text(settings: Settings, artifact: ResultArtifact) -> str:
+    """Describe the artifact snapshot. Reuses v3.0 analysis_text when present (no pandas import);
+    otherwise computes a profile from the stored rows (needs the analysis extra). Never re-runs SQL."""
+    if artifact.analysis_text:
+        return artifact.analysis_text
+    profile = profile_result_dataframe(
+        artifact.columns, artifact.rows, profiled_truncated=artifact.truncated
+    )
+    return dataframe_profile_text(profile, settings.max_analysis_columns)
+
+
+def materialize_artifact_rows(
+    settings: Settings, artifact: ResultArtifact
+) -> tuple[tuple[str, ...], tuple[tuple[Any, ...], ...], bool]:
+    """Rows to export: the displayed rows when complete, else one bounded read-only re-fetch
+    (up to max_analysis_rows) returning the re-fetch's own columns + rows."""
+    if not artifact.truncated:
+        return artifact.columns, artifact.rows, False
+    if not artifact.sql:
+        raise AppError("Cannot export the full result because the SQL is unavailable.")
+    bigger = execute_readonly_query(
+        settings.source_db_path,
+        artifact.sql,
+        max_rows=settings.max_analysis_rows,
+        timeout_ms=settings.query_timeout_ms,
+    )
+    return bigger.columns, bigger.rows, bigger.truncated
+
+
+def _csv_cell(value: Any) -> Any:
+    if value is None:
+        return ""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return "<binary>"
+    return value
+
+
+def _next_output_path(output_dir: Path, stem: str = "result", suffix: str = ".csv") -> Path:
+    for index in range(1, 10000):
+        candidate = output_dir / f"{stem}_{index:03d}{suffix}"
+        if not candidate.exists():
+            return candidate
+    raise AppError("Could not find a free output filename in the output directory.")
+
+
+def export_artifact_csv(
+    settings: Settings, artifact: ResultArtifact, output_dir: Path
+) -> ExportResult:
+    columns, rows, truncated = materialize_artifact_rows(settings, artifact)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = _next_output_path(output_dir)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(list(columns))
+        for row in rows:
+            writer.writerow([_csv_cell(value) for value in row])
+    return ExportResult(path=path, row_count=len(rows), truncated=truncated)
+
+
+def build_summary_payload(
     question: str,
     sql: str,
     columns: tuple[str, ...],
     rows: tuple[tuple[Any, ...], ...],
     truncated: bool,
+    analysis_text: str | None = None,
 ) -> str:
+    """Build the grounded LLM summary prompt (factored out so it is unit-testable)."""
     payload = {
         "question": question,
         "sql": sql,
@@ -1634,14 +1943,34 @@ def generate_llm_summary(
         "row_count": len(rows),
         "truncated": truncated,
     }
-    prompt = f"""Summarize the SQL result for the user's question in 1 to 3 short sentences.
-Use only the returned table data. Do not invent causes, missing rows, or outside facts.
-If the table is insufficient to answer the question, say that plainly.
+    prompt = (
+        "Summarize the SQL result for the user's question in 1 to 3 short sentences.\n"
+        "Use only the returned table data. Do not invent causes, missing rows, or outside facts.\n"
+        "If the table is insufficient to answer the question, say that plainly.\n\n"
+        f"Data:\n{json.dumps(payload, default=str, ensure_ascii=False)}\n"
+    )
+    if analysis_text:
+        prompt += (
+            "\nDeterministic result profile (computed from the returned rows):\n"
+            f"{analysis_text}\n"
+            "Use this profile only to summarize the returned result; do not invent rows or "
+            "columns. The profile may describe a capped subset, so do not claim it covers all "
+            "rows unless the result was not truncated.\n"
+        )
+    return prompt + "\nSummary:"
 
-Data:
-{json.dumps(payload, default=str, ensure_ascii=False)}
 
-Summary:"""
+def generate_llm_summary(
+    client: OpenAI,
+    settings: Settings,
+    question: str,
+    sql: str,
+    columns: tuple[str, ...],
+    rows: tuple[tuple[Any, ...], ...],
+    truncated: bool,
+    analysis_text: str | None = None,
+) -> str:
+    prompt = build_summary_payload(question, sql, columns, rows, truncated, analysis_text)
     response = client.chat.completions.create(
         model=settings.summary_model,
         messages=[
@@ -1662,6 +1991,7 @@ def summarize_result(
     sql: str,
     execution: ExecutionResult,
     expectation: ShapeExpectation | None = None,
+    analysis_text: str | None = None,
 ) -> tuple[str, str, str | None]:
     fallback = deterministic_summary(
         question, execution.columns, execution.rows, execution.truncated, expectation
@@ -1677,6 +2007,7 @@ def summarize_result(
             execution.columns,
             execution.rows,
             execution.truncated,
+            analysis_text,
         )
         if not summary:
             return fallback, "deterministic", "LLM summary was empty."
@@ -1896,8 +2227,23 @@ def answer_question(
         result.rows = execution.rows
         result.truncated = execution.truncated
         result.execution_ms = execution.execution_ms
+        if settings.enable_dataframe_analysis:
+            try:
+                result.analysis, result.analysis_text = analyze_execution(
+                    settings, result.sql or "", execution
+                )
+            except AppError as exc:
+                result.analysis_error = str(exc)
+            except Exception as exc:  # analysis must never fail a successful answer
+                result.analysis_error = f"Analysis failed: {exc}"
         result.summary, result.summary_mode, result.summary_error = summarize_result(
-            client, settings, question, result.sql or "", execution, expectation
+            client,
+            settings,
+            question,
+            result.sql or "",
+            execution,
+            expectation,
+            analysis_text=result.analysis_text,
         )
         result.success = True
         result.executed = True
