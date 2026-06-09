@@ -3,12 +3,13 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
 import time
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -188,6 +189,22 @@ class ExportResult:
     path: Path
     row_count: int
     truncated: bool
+
+
+@dataclass(frozen=True)
+class ChartResult:
+    path: Path
+    chart_type: str
+    x_column: str | None
+    y_column: str | None
+    row_count: int  # number of points actually plotted (after skipping missing/invalid)
+
+
+@dataclass(frozen=True)
+class RoutedArtifactCommand:
+    command: str  # describe, head, tail, export, sql, columns, artifacts, plot
+    arg: str  # e.g. "" / "5" / "csv" / "bar x=GenreName y=TotalRevenue"
+    reason: str  # short tag for logging/UX, e.g. "head-count", "plot-hist"
 
 
 @dataclass(frozen=True)
@@ -1924,6 +1941,350 @@ def export_artifact_csv(
         for row in rows:
             writer.writerow([_csv_cell(value) for value in row])
     return ExportResult(path=path, row_count=len(rows), truncated=truncated)
+
+
+# --- v3.2: deterministic chart artifacts -----------------------------------------------
+
+_CHART_TYPES = ("bar", "line", "scatter", "hist")
+
+
+def _require_viz_libs() -> Any:
+    """Lazy-import matplotlib with a non-interactive backend, raising a friendly error.
+
+    Forces the Agg backend before importing pyplot so chart rendering never needs a display
+    and never opens a window. Mirrors _require_dataframe_libs for the optional analysis extra.
+    """
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise AppError("Chart export needs the viz extra: uv sync --extra viz") from exc
+    return plt
+
+
+def parse_key_value_args(arg: str) -> dict[str, str]:
+    """Parse space-separated ``key=value`` pairs into a dict.
+
+    Keys are lowercased; values keep their original casing (they are column names). An empty
+    argument returns ``{}`` so the option-specific error fires later. Tokens without ``=`` and
+    duplicate keys are rejected.
+    """
+    options: dict[str, str] = {}
+    stripped = arg.strip()
+    if not stripped:
+        return options
+    for token in stripped.split():
+        if "=" not in token:
+            raise AppError(f"Invalid option '{token}'. Use key=value, e.g. x=Name.")
+        raw_key, _, raw_value = token.partition("=")
+        key = raw_key.strip().lower()
+        value = raw_value.strip()
+        if not key or not value:
+            raise AppError(f"Invalid option '{token}'. Use key=value, e.g. x=Name.")
+        if key in options:
+            raise AppError(f"Duplicate option: {key}")
+        options[key] = value
+    return options
+
+
+def parse_plot_command_args(arg: str) -> tuple[str, dict[str, str]]:
+    """Split a ``:plot`` argument into ``(chart_type, options)``.
+
+    Examples: ``"bar x=Name y=Revenue"`` -> ``("bar", {"x": "Name", "y": "Revenue"})``;
+    ``"hist column=Revenue"`` -> ``("hist", {"column": "Revenue"})``.
+    """
+    chart_type, _, rest = arg.strip().partition(" ")
+    chart_type = chart_type.strip().lower()
+    if not chart_type:
+        raise AppError("Missing chart type. Use :plot bar x=<column> y=<column>.")
+    if chart_type not in _CHART_TYPES:
+        raise AppError(f"Unsupported chart type: {chart_type}")
+    return chart_type, parse_key_value_args(rest)
+
+
+def resolve_column(columns: tuple[str, ...], requested: str) -> str:
+    """Resolve a requested column to an actual artifact column name.
+
+    Exact match wins; otherwise a unique case-insensitive match is used. No match raises
+    "Unknown column"; multiple case-insensitive matches raise "Ambiguous column".
+    """
+    if requested in columns:
+        return requested
+    lowered = requested.lower()
+    matches = [name for name in columns if name.lower() == lowered]
+    if not matches:
+        raise AppError(f"Unknown column: {requested}")
+    if len(matches) > 1:
+        raise AppError(f"Ambiguous column: {requested}")
+    return matches[0]
+
+
+def artifact_rows_as_dicts(artifact: ResultArtifact) -> list[dict[str, object]]:
+    """Convert an artifact's columns + rows into row dicts keyed by unique column names.
+
+    Reuses make_unique_column_names so duplicate result columns get deterministic keys
+    (e.g. "count", "count__2"); resolve_column is given the same names so lookups match.
+    """
+    names = make_unique_column_names(artifact.columns)
+    return [dict(zip(names, row)) for row in artifact.rows]
+
+
+def _next_chart_path(charts_dir: Path) -> Path:
+    """Return the next free chart_NNN.png path; raise if none is available."""
+    for index in range(1, 10000):
+        candidate = charts_dir / f"chart_{index:03d}.png"
+        if not candidate.exists():
+            return candidate
+    raise AppError("Could not find a free chart filename in the charts directory.")
+
+
+def _chart_numeric(value: Any) -> float | None:
+    """Coerce a value to a finite float for plotting, or None if it is not plottable.
+
+    Bools are rejected (a bool is an int subclass; plotting True as 1.0 is surprising).
+    None and empty/blank strings are treated as missing. Non-finite floats (NaN, +/-inf)
+    are dropped. Numeric strings that float() can parse are accepted.
+    """
+    if isinstance(value, bool):
+        return None
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            number = float(text)
+        except ValueError:
+            return None
+    elif isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def export_artifact_chart(settings: Settings, artifact: ResultArtifact, arg: str) -> ChartResult:
+    """Render the last artifact snapshot to a PNG under OUTPUT_DIR/charts deterministically.
+
+    Uses only artifact.columns and artifact.rows: no model call, no SQL re-fetch, no generated
+    code. matplotlib is imported lazily (viz extra) only after validation passes.
+    """
+    chart_type, options = parse_plot_command_args(arg)
+    if not artifact.rows:
+        raise AppError("No rows to plot.")
+
+    if chart_type == "hist":
+        required = ("column",)
+    else:
+        required = ("x", "y")
+    missing = [key for key in required if key not in options]
+    if missing:
+        raise AppError(f"Plot type '{chart_type}' requires options: {', '.join(required)}.")
+    extra = [key for key in options if key not in required]
+    if extra:
+        raise AppError(f"Plot type '{chart_type}' does not support options: {', '.join(sorted(extra))}.")
+
+    names = make_unique_column_names(artifact.columns)
+    dicts = artifact_rows_as_dicts(artifact)
+
+    x_column: str | None = None
+    y_column: str | None = None
+    labels: list[str] = []
+    xs: list[float] = []
+    ys: list[float] = []
+    values: list[float] = []
+
+    if chart_type in {"bar", "line"}:
+        x_column = resolve_column(names, options["x"])
+        y_column = resolve_column(names, options["y"])
+        for row in dicts:
+            y = _chart_numeric(row[y_column])
+            if y is None:
+                continue
+            raw_x = row[x_column]
+            labels.append("" if raw_x is None else str(raw_x))
+            ys.append(y)
+        if not ys:
+            raise AppError("No valid numeric data to plot.")
+        plotted = len(ys)
+    elif chart_type == "scatter":
+        x_column = resolve_column(names, options["x"])
+        y_column = resolve_column(names, options["y"])
+        for row in dicts:
+            x = _chart_numeric(row[x_column])
+            y = _chart_numeric(row[y_column])
+            if x is None or y is None:
+                continue
+            xs.append(x)
+            ys.append(y)
+        if not xs:
+            raise AppError("No valid numeric data to plot.")
+        plotted = len(xs)
+    else:  # hist
+        x_column = resolve_column(names, options["column"])
+        for row in dicts:
+            value = _chart_numeric(row[x_column])
+            if value is None:
+                continue
+            values.append(value)
+        if not values:
+            raise AppError("No valid numeric data to plot.")
+        plotted = len(values)
+
+    plt = _require_viz_libs()
+    charts_dir = settings.output_path / "charts"
+    charts_dir.mkdir(parents=True, exist_ok=True)
+    path = _next_chart_path(charts_dir)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    try:
+        if chart_type == "bar":
+            ax.bar(labels, ys)
+            ax.tick_params(axis="x", labelrotation=45)
+            ax.set_title(f"Bar: {y_column} by {x_column}")
+            ax.set_xlabel(x_column)
+            ax.set_ylabel(y_column)
+        elif chart_type == "line":
+            ax.plot(labels, ys, marker="o")
+            ax.tick_params(axis="x", labelrotation=45)
+            ax.set_title(f"Line: {y_column} by {x_column}")
+            ax.set_xlabel(x_column)
+            ax.set_ylabel(y_column)
+        elif chart_type == "scatter":
+            ax.scatter(xs, ys)
+            ax.set_title(f"Scatter: {y_column} vs {x_column}")
+            ax.set_xlabel(x_column)
+            ax.set_ylabel(y_column)
+        else:  # hist
+            ax.hist(values)
+            ax.set_title(f"Histogram: {x_column}")
+            ax.set_xlabel(x_column)
+            ax.set_ylabel("Frequency")
+        plt.tight_layout()
+        fig.savefig(path)
+    finally:
+        plt.close(fig)
+
+    return ChartResult(
+        path=path,
+        chart_type=chart_type,
+        x_column=x_column,
+        y_column=y_column,
+        row_count=plotted,
+    )
+
+
+def route_artifact_followup(text: str, columns: Sequence[str]) -> RoutedArtifactCommand | None:
+    """Map a natural-language follow-up to an existing artifact command, deterministically.
+
+    Pure and conservative: returns a RoutedArtifactCommand only when the text clearly refers to
+    the current result; otherwise returns None so the caller treats it as a new DB question. It
+    never calls the model, generates code, or runs SQL. Only the chart-resolution path may raise
+    AppError (unknown/ambiguous column); every other family returns a command or None.
+    """
+    norm = re.sub(r"\s+", " ", text.strip().lower())
+    if not norm:
+        return None
+    core_text = norm.rstrip("?.!").strip()
+
+    # A. describe (deterministic profile -- intentionally not "summarize this result")
+    if core_text in {
+        "describe this",
+        "describe this result",
+        "profile this",
+        "show profile",
+        "show stats",
+        "statistics",
+    }:
+        return RoutedArtifactCommand("describe", "", "describe-phrase")
+
+    # B. head (anchored; "top 5 genres by revenue" will not match)
+    for pattern in (
+        r"head(?:\s+(\d+))?",
+        r"(?:show\s+)?(?:first|top)\s+(\d+)\s+rows",
+        r"(?:show\s+)?(?:first|top)\s+rows",
+        r"(?:show\s+)?(?:first|top)\s+(\d+)",
+    ):
+        match = re.fullmatch(pattern, core_text)
+        if match:
+            count = match.group(1) if (match.re.groups and match.group(1)) else "10"
+            return RoutedArtifactCommand("head", count, "head")
+
+    # C. tail (symmetric with head)
+    for pattern in (
+        r"tail(?:\s+(\d+))?",
+        r"(?:show\s+)?(?:last|bottom)\s+(\d+)\s+rows",
+        r"(?:show\s+)?(?:last|bottom)\s+rows",
+        r"(?:show\s+)?(?:last|bottom)\s+(\d+)",
+    ):
+        match = re.fullmatch(pattern, core_text)
+        if match:
+            count = match.group(1) if (match.re.groups and match.group(1)) else "10"
+            return RoutedArtifactCommand("tail", count, "tail")
+
+    # D. export
+    if re.fullmatch(r"(?:export|save|download)(?:\s+to)?\s+csv", core_text):
+        return RoutedArtifactCommand("export", "csv", "export-csv")
+
+    # E. sql
+    if re.fullmatch(
+        r"(?:show\s+(?:the\s+)?sql|what\s+sql\s+did\s+you\s+run|show\s+(?:the\s+)?query)",
+        core_text,
+    ):
+        return RoutedArtifactCommand("sql", "", "sql")
+
+    # F. columns
+    if re.fullmatch(
+        r"(?:(?:show|list)\s+columns|what\s+columns\s+are\s+in\s+this\s+result)", core_text
+    ):
+        return RoutedArtifactCommand("columns", "", "columns")
+
+    # G. artifacts (intentionally not bare "show results")
+    if re.fullmatch(
+        r"(?:(?:show|list)\s+artifacts|(?:show|list)\s+session\s+(?:artifacts|results))",
+        core_text,
+    ):
+        return RoutedArtifactCommand("artifacts", "", "artifacts")
+
+    # H. plot (checked last; requires explicit options, else None)
+    if re.search(r"\b(?:plot\s+bar|bar\s+chart)\b", norm):
+        chart_type = "bar"
+    elif re.search(r"\b(?:plot\s+line|line\s+chart)\b", norm):
+        chart_type = "line"
+    elif re.search(r"\b(?:plot\s+scatter|scatter\s+plot)\b", norm):
+        chart_type = "scatter"
+    elif re.search(r"\b(?:plot\s+hist|histogram|hist)\b", norm):
+        chart_type = "hist"
+    else:
+        return None
+
+    names = make_unique_column_names(tuple(columns))
+    if chart_type == "hist":
+        column_match = (
+            re.search(r"column=(\S+)", norm)
+            or re.search(r"histogram\s+of\s+(\S+)", norm)
+            or re.search(r"histogram\s+(\S+)", norm)
+        )
+        if column_match is None:
+            return None
+        token = column_match.group(1).strip("?.!")
+        if not token or token in {"of", "column"}:
+            return None
+        resolved = resolve_column(names, token)
+        return RoutedArtifactCommand("plot", f"hist column={resolved}", "plot-hist")
+
+    x_match = re.search(r"x=(\S+)", norm)
+    y_match = re.search(r"y=(\S+)", norm)
+    if x_match is None or y_match is None:
+        return None
+    resolved_x = resolve_column(names, x_match.group(1).strip("?.!"))
+    resolved_y = resolve_column(names, y_match.group(1).strip("?.!"))
+    return RoutedArtifactCommand(
+        "plot", f"{chart_type} x={resolved_x} y={resolved_y}", f"plot-{chart_type}"
+    )
 
 
 def build_summary_payload(

@@ -94,6 +94,10 @@ generated code):
 | `:head [N]` | Show the first N rows (default 10) |
 | `:tail [N]` | Show the last N rows (default 10) |
 | `:export [csv]` | Export the result to `OUTPUT_DIR` as CSV |
+| `:plot bar x=<column> y=<column>` | Save a bar chart PNG to `OUTPUT_DIR/charts/` |
+| `:plot line x=<column> y=<column>` | Save a line chart PNG |
+| `:plot scatter x=<column> y=<column>` | Save a scatter chart PNG |
+| `:plot hist column=<column>` | Save a histogram PNG |
 | `:artifacts` | List this session's results |
 | `:help` | Show this help |
 | `:q` / `exit` / `quit` | Quit |
@@ -104,6 +108,50 @@ session; only exported CSV files persist.** `:describe` recomputes from the stor
 does a bounded read-only re-fetch up to `MAX_ANALYSIS_ROWS` when the displayed result was
 truncated (it reuses the validated SQL through the read-only executor; no extra required), and
 reports the exact row count and whether the export was capped.
+
+**Charts (`:plot`)** are deterministic artifact commands like the rest: they do **not** call
+the model, do **not** run generated code, and do **not** re-run SQL. Unlike `:export csv`,
+`:plot` uses **only the rows currently stored in the session artifact** — it does not perform
+the fuller re-fetch that `:export csv` may do when a result was truncated. PNGs are written to
+`OUTPUT_DIR/charts/` as `chart_001.png`, `chart_002.png`, … For bar/line, `x` may be
+text/date/numeric and `y` must be numeric; scatter needs both numeric; hist needs a numeric
+column. Non-numeric/empty cells are skipped. Because options are parsed as whitespace-separated
+`key=value` tokens, **column names must not contain spaces** — alias them in SQL first, e.g.
+`SELECT Total AS RevenueTotal ...`, then `:plot bar x=Genre y=RevenueTotal`.
+
+Charting requires the optional `viz` extra (matplotlib). Install it once and run normally:
+
+```bash
+uv sync --extra viz
+ENABLE_DATAFRAME_ANALYSIS=true uv run python app.py ask --db data/test_dbs/Chinook.db
+```
+
+`uv run --extra viz python app.py ...` works as a one-shot alternative. If `:plot` is used
+without the extra installed, the session prints a notice and continues. To enable both result
+analysis and charts together, install both extras: `uv sync --extra analysis --extra viz`.
+
+##### Natural-language follow-ups
+
+In the interactive assistant you can phrase follow-ups in plain English instead of the exact
+colon syntax. When a result already exists and the text clearly refers to it, it is routed to
+the matching artifact command (the session prints `Routed to :<command>`):
+
+- `describe this result` → `:describe`
+- `show first 5 rows` → `:head 5`
+- `show last 10 rows` → `:tail 10`
+- `export to csv` → `:export csv`
+- `show sql` → `:sql`
+- `show columns` → `:columns`
+- `show artifacts` → `:artifacts`
+- `plot bar x=GenreName y=TotalRevenue` → `:plot bar x=GenreName y=TotalRevenue`
+- `histogram of TotalRevenue` → `:plot hist column=TotalRevenue`
+
+This is a **deterministic router** to the existing artifact commands: it does **not** call the
+model, and it does **not** generate or execute any code. Chart column names are matched
+case-insensitively against the current result's columns. **Ambiguous or unrecognized requests
+are treated as new database questions** rather than guessed — so an ordinary question like
+`top 5 genres by revenue` still runs the Text-to-SQL pipeline. The router is interactive-only;
+one-shot `ask "<question>"` never routes.
 
 Ask one question and exit:
 
@@ -145,7 +193,7 @@ Important settings in `.env`:
 - `ENABLE_DATAFRAME_ANALYSIS`: opt-in deterministic result analysis (needs the `analysis` extra), default `false`.
 - `MAX_ANALYSIS_ROWS`: row cap for the analysis fetch when displayed rows were truncated, default `5000`.
 - `MAX_ANALYSIS_COLUMNS`: maximum columns rendered in the analysis panel / summary grounding, default `30`.
-- `OUTPUT_DIR`: directory for interactive `:export` CSV files, default `data/outputs` (gitignored).
+- `OUTPUT_DIR`: directory for interactive `:export` CSV files and `:plot` charts (under `charts/`), default `data/outputs` (gitignored).
 
 If only row data changes while table schema is unchanged, the app warns but does not reindex. If table schema changes, `ask` auto-reindexes before answering when `AUTO_REINDEX=true`.
 

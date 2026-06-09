@@ -22,12 +22,14 @@ from core import (
     artifact_preview_rows,
     create_openai_client,
     download_northwind,
+    export_artifact_chart,
     export_artifact_csv,
     index_schema,
     make_result_artifact,
     parse_colon_command,
     parse_count,
     read_query_logs,
+    route_artifact_followup,
     verify_sqlite_database,
 )
 
@@ -41,6 +43,7 @@ ARTIFACT_HELP = """Artifact commands (operate on the last result):
   :head [N]      Show the first N rows (default 10)
   :tail [N]      Show the last N rows (default 10)
   :export [csv]  Export the result to OUTPUT_DIR as CSV
+  :plot ...      Save a chart to OUTPUT_DIR/charts (bar/line/scatter x=.. y=.. | hist column=..)
   :artifacts     List this session's results
   :help          Show this help
   :q             Quit"""
@@ -160,6 +163,17 @@ def ask(
                 break
             handle_artifact_command(name, arg, artifacts, settings, verbose)
             continue
+        if artifacts:
+            try:
+                route = route_artifact_followup(user_input, artifacts[-1].columns)
+            except AppError as exc:
+                console.print(Panel(str(exc), title="Could not route", border_style="yellow"))
+                continue
+            if route is not None:
+                target = f":{route.command}" if not route.arg else f":{route.command} {route.arg}"
+                console.print(f"[dim]Routed to {target}[/dim]")
+                handle_artifact_command(route.command, route.arg, artifacts, settings, verbose)
+                continue
         result = run_question(settings, client, user_input, verbose)
         if result.success and result.sql and result.columns:
             artifacts.append(make_result_artifact(len(artifacts) + 1, result))
@@ -290,6 +304,14 @@ def handle_artifact_command(
                 f"[yellow]Export was capped at MAX_ANALYSIS_ROWS={settings.max_analysis_rows}; "
                 "more rows may exist.[/yellow]"
             )
+    elif name == "plot":
+        try:
+            chart = export_artifact_chart(settings, last, arg)
+        except AppError as exc:
+            console.print(Panel(str(exc), title="Plot failed", border_style="yellow"))
+            return
+        console.print(f"[green]Saved chart[/green] {chart.path}")
+        console.print(f"Chart type: {chart.chart_type}; rows plotted: {chart.row_count}")
     else:
         console.print(Panel(ARTIFACT_HELP, title=f"Unknown command :{name}"))
 

@@ -9,6 +9,7 @@ import httpx
 import openai
 import pytest
 
+import core
 from core import (
     AnswerResult,
     AppError,
@@ -37,11 +38,18 @@ from core import (
     infer_shape_expectation,
     index_schema,
     log_query,
+    export_artifact_chart,
+    _chart_numeric,
     make_result_artifact,
     make_unique_column_names,
     metadata_connection,
+    RoutedArtifactCommand,
     parse_colon_command,
     parse_count,
+    parse_key_value_args,
+    parse_plot_command_args,
+    resolve_column,
+    route_artifact_followup,
     profile_result_dataframe,
     quote_guidance,
     quote_identifier,
@@ -1337,3 +1345,229 @@ def test_verify_sqlite_database_rejects_empty_database(tmp_path: Path) -> None:
         conn.execute("PRAGMA user_version = 1")
     with pytest.raises(AppError, match="No user tables or views"):
         verify_sqlite_database(db)
+
+
+# --- v3.2: deterministic chart artifacts -----------------------------------------------
+
+
+def _chart_settings(tmp_path: Path) -> Settings:
+    return Settings(
+        omlx_api_key="test",
+        db_path=tmp_path / "x.db",
+        metadata_db_path=tmp_path / "m.db",
+        output_dir=tmp_path / "outputs",
+    )
+
+
+def test_parse_key_value_args_parses_pairs() -> None:
+    assert parse_key_value_args("x=Name y=Revenue") == {"x": "Name", "y": "Revenue"}
+    assert parse_key_value_args("") == {}
+    # keys lowercase; values keep their casing
+    assert parse_key_value_args("X=Name") == {"x": "Name"}
+
+
+def test_parse_key_value_args_rejects_token_without_equals() -> None:
+    with pytest.raises(AppError):
+        parse_key_value_args("x=Name Revenue")
+
+
+def test_parse_key_value_args_rejects_duplicate_keys() -> None:
+    with pytest.raises(AppError):
+        parse_key_value_args("x=Name x=Other")
+
+
+def test_parse_plot_command_args_parses_bar_and_hist() -> None:
+    assert parse_plot_command_args("bar x=Name y=Revenue") == (
+        "bar",
+        {"x": "Name", "y": "Revenue"},
+    )
+    assert parse_plot_command_args("hist column=Revenue") == ("hist", {"column": "Revenue"})
+
+
+def test_parse_plot_command_args_rejects_missing_type() -> None:
+    with pytest.raises(AppError):
+        parse_plot_command_args("")
+
+
+def test_parse_plot_command_args_rejects_unsupported_type() -> None:
+    with pytest.raises(AppError):
+        parse_plot_command_args("pie x=Name y=Revenue")
+
+
+def test_resolve_column_exact_and_case_insensitive() -> None:
+    columns = ("Name", "Revenue")
+    assert resolve_column(columns, "Name") == "Name"
+    assert resolve_column(columns, "revenue") == "Revenue"
+
+
+def test_resolve_column_unknown_raises() -> None:
+    with pytest.raises(AppError):
+        resolve_column(("Name", "Revenue"), "Missing")
+
+
+def test_resolve_column_ambiguous_case_insensitive_raises() -> None:
+    with pytest.raises(AppError):
+        resolve_column(("Name", "name"), "NAME")
+
+
+def test_chart_numeric_coercion_rules() -> None:
+    assert _chart_numeric(1) == 1.0
+    assert _chart_numeric(1.5) == 1.5
+    assert _chart_numeric("2.0") == 2.0
+    for missing in (True, False, None, "", "abc", float("nan"), float("inf")):
+        assert _chart_numeric(missing) is None
+
+
+def test_export_artifact_chart_rejects_empty_rows(tmp_path: Path) -> None:
+    settings = _chart_settings(tmp_path)
+    artifact = _make_artifact((), columns=("Name", "Revenue"))
+    with pytest.raises(AppError):
+        export_artifact_chart(settings, artifact, "bar x=Name y=Revenue")
+
+
+def test_export_artifact_chart_propagates_missing_viz(tmp_path: Path, monkeypatch) -> None:
+    def _raise() -> object:
+        raise AppError("Chart export needs the viz extra: uv sync --extra viz")
+
+    monkeypatch.setattr(core, "_require_viz_libs", _raise)
+    settings = _chart_settings(tmp_path)
+    artifact = _make_artifact(
+        (("a", 1), ("b", 2)), columns=("Name", "Revenue"), sql="SELECT Name, Revenue FROM t"
+    )
+    with pytest.raises(AppError, match="viz extra"):
+        export_artifact_chart(settings, artifact, "bar x=Name y=Revenue")
+
+
+def test_export_artifact_chart_bar_writes_png(tmp_path: Path) -> None:
+    pytest.importorskip("matplotlib")
+    settings = _chart_settings(tmp_path)
+    artifact = _make_artifact(
+        (("a", 10), ("b", 20), ("c", 30)),
+        columns=("Name", "Revenue"),
+        sql="SELECT Name, Revenue FROM t",
+    )
+    chart = export_artifact_chart(settings, artifact, "bar x=Name y=Revenue")
+    assert chart.path.name == "chart_001.png"
+    assert chart.path.exists()
+    assert chart.chart_type == "bar"
+    assert chart.row_count == 3
+
+
+def test_export_artifact_chart_sequential_names(tmp_path: Path) -> None:
+    pytest.importorskip("matplotlib")
+    settings = _chart_settings(tmp_path)
+    artifact = _make_artifact(
+        (("a", 10), ("b", 20)),
+        columns=("Name", "Revenue"),
+        sql="SELECT Name, Revenue FROM t",
+    )
+    first = export_artifact_chart(settings, artifact, "bar x=Name y=Revenue")
+    second = export_artifact_chart(settings, artifact, "bar x=Name y=Revenue")
+    assert first.path.name == "chart_001.png"
+    assert second.path.name == "chart_002.png"
+    assert second.path.exists()
+
+
+def test_export_artifact_chart_hist_writes_png(tmp_path: Path) -> None:
+    pytest.importorskip("matplotlib")
+    settings = _chart_settings(tmp_path)
+    artifact = _make_artifact(
+        ((10,), (20,), (30,), (40,)),
+        columns=("Revenue",),
+        sql="SELECT Revenue FROM t",
+    )
+    chart = export_artifact_chart(settings, artifact, "hist column=Revenue")
+    assert chart.path.exists()
+    assert chart.chart_type == "hist"
+    assert chart.x_column == "Revenue"
+    assert chart.y_column is None
+    assert chart.row_count == 4
+
+
+def test_export_artifact_chart_rejects_non_numeric(tmp_path: Path) -> None:
+    pytest.importorskip("matplotlib")
+    settings = _chart_settings(tmp_path)
+    artifact = _make_artifact(
+        (("a", 10), ("b", 20)),
+        columns=("Name", "Revenue"),
+        sql="SELECT Name, Revenue FROM t",
+    )
+    with pytest.raises(AppError):
+        export_artifact_chart(settings, artifact, "scatter x=Name y=Revenue")
+    with pytest.raises(AppError):
+        export_artifact_chart(settings, artifact, "hist column=Name")
+
+
+# --- v3.3: natural-language artifact command router ------------------------------------
+
+_ROUTER_COLUMNS = ("GenreName", "TotalRevenue", "TrackCount")
+
+
+def test_route_describe_phrase() -> None:
+    route = route_artifact_followup("describe this result", _ROUTER_COLUMNS)
+    assert route is not None
+    assert route.command == "describe"
+    assert route.arg == ""
+
+
+def test_route_head_with_and_without_count() -> None:
+    five = route_artifact_followup("show first 5 rows", _ROUTER_COLUMNS)
+    assert (five.command, five.arg) == ("head", "5")
+    default = route_artifact_followup("head", _ROUTER_COLUMNS)
+    assert (default.command, default.arg) == ("head", "10")
+
+
+def test_route_tail_with_count() -> None:
+    route = route_artifact_followup("show last 3 rows", _ROUTER_COLUMNS)
+    assert (route.command, route.arg) == ("tail", "3")
+
+
+def test_route_export_csv() -> None:
+    route = route_artifact_followup("export to csv", _ROUTER_COLUMNS)
+    assert (route.command, route.arg) == ("export", "csv")
+
+
+def test_route_sql_columns_artifacts() -> None:
+    assert route_artifact_followup("show sql", _ROUTER_COLUMNS).command == "sql"
+    assert route_artifact_followup("show columns", _ROUTER_COLUMNS).command == "columns"
+    assert route_artifact_followup("show artifacts", _ROUTER_COLUMNS).command == "artifacts"
+
+
+def test_route_plot_bar_canonicalizes_columns() -> None:
+    route = route_artifact_followup("plot bar x=genrename y=totalrevenue", _ROUTER_COLUMNS)
+    assert route.command == "plot"
+    assert route.arg == "bar x=GenreName y=TotalRevenue"
+
+
+def test_route_histogram_of_column() -> None:
+    route = route_artifact_followup("histogram of totalrevenue", _ROUTER_COLUMNS)
+    assert route.command == "plot"
+    assert route.arg == "hist column=TotalRevenue"
+
+
+def test_route_explicit_chart_bad_column_raises() -> None:
+    with pytest.raises(AppError):
+        route_artifact_followup("histogram of missing", _ROUTER_COLUMNS)
+    with pytest.raises(AppError):
+        route_artifact_followup("plot bar x=missing y=TotalRevenue", _ROUTER_COLUMNS)
+
+
+def test_route_ambiguous_chart_column_raises() -> None:
+    # The router lowercases the token, so two case-variants that both differ from the
+    # lowercased token by case ("name" matches neither "Name" nor "NAME" exactly) are ambiguous.
+    columns = ("Name", "NAME")
+    with pytest.raises(AppError):
+        route_artifact_followup("histogram of name", columns)
+
+
+def test_route_returns_none_for_vague_and_db_questions() -> None:
+    for text in (
+        "which genres generated the most revenue?",
+        "how many customers are there?",
+        "show sales by country",
+        "top 5 genres by revenue",
+        "plot revenue by country",
+        "show results",
+        "summarize this result",
+    ):
+        assert route_artifact_followup(text, _ROUTER_COLUMNS) is None
