@@ -208,6 +208,33 @@ class RoutedArtifactCommand:
 
 
 @dataclass(frozen=True)
+class ArtifactTransformResult:
+    artifact: ResultArtifact
+    operation: str
+    row_count: int
+
+
+@dataclass(frozen=True)
+class WorkspaceSaveResult:
+    path: Path
+    artifact_count: int
+
+
+@dataclass(frozen=True)
+class WorkspaceLoadResult:
+    artifacts: tuple[ResultArtifact, ...]
+    path: Path
+
+
+@dataclass(frozen=True)
+class ReportExportResult:
+    path: Path
+    artifact_count: int
+    format: str
+
+
+
+@dataclass(frozen=True)
 class ShapeExpectation:
     entity_terms: tuple[str, ...] = ()
     requires_numeric: bool = False
@@ -1943,6 +1970,195 @@ def export_artifact_csv(
     return ExportResult(path=path, row_count=len(rows), truncated=truncated)
 
 
+# --- v3.6: persistent artifact workspace -----------------------------------------------
+
+WORKSPACE_FORMAT_VERSION = 1
+
+
+def _app_version() -> str:
+    """Best-effort package version for the workspace manifest (informational only)."""
+    try:
+        from importlib.metadata import version
+
+        return version("sql-data-analyst-agent")
+    except Exception:
+        return "unknown"
+
+
+def sanitize_workspace_name(name: str) -> str:
+    """Reduce a user-supplied workspace name to a filesystem-safe stem.
+
+    Letters/digits/dash/underscore are kept; every other character becomes ``_``. A name with no
+    alphanumeric character (empty, blank, or all punctuation) is rejected.
+    """
+    safe = "".join(char if (char.isalnum() or char in {"-", "_"}) else "_" for char in name.strip())
+    if not any(char.isalnum() for char in safe):
+        raise AppError("Workspace name must contain a letter or number.")
+    return safe
+
+
+def _next_workspace_path(base_dir: Path, name: str | None = None) -> Path:
+    """Pick a fresh workspace directory path, adding a numeric suffix on same-second collisions."""
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    stem = f"{sanitize_workspace_name(name)}_{timestamp}" if name else f"session_{timestamp}"
+    candidate = base_dir / stem
+    if not candidate.exists():
+        return candidate
+    for index in range(2, 1000):
+        alternate = base_dir / f"{stem}_{index}"
+        if not alternate.exists():
+            return alternate
+    raise AppError("Could not find a free workspace directory name.")
+
+
+def save_artifact_workspace(
+    settings: Settings, artifacts: Sequence[ResultArtifact], name: str | None = None
+) -> WorkspaceSaveResult:
+    """Persist the session's artifacts to OUTPUT_DIR/workspaces/<dir> (explicit save; no model/SQL)."""
+    if not artifacts:
+        raise AppError("No artifacts to save.")
+    workspaces_dir = settings.output_path / "workspaces"
+    workspaces_dir.mkdir(parents=True, exist_ok=True)
+    workspace_path = _next_workspace_path(workspaces_dir, name)
+    workspace_path.mkdir(parents=True, exist_ok=False)
+
+    entries: list[dict[str, Any]] = []
+    for index, artifact in enumerate(artifacts, start=1):
+        csv_file = f"artifact_{index:03d}.csv"
+        sql_file = f"artifact_{index:03d}.sql"
+        profile_file = f"artifact_{index:03d}_profile.txt" if artifact.analysis_text else None
+
+        with (workspace_path / csv_file).open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(list(artifact.columns))
+            for row in artifact.rows:
+                writer.writerow([_csv_cell(value) for value in row])
+        (workspace_path / sql_file).write_text(artifact.sql, encoding="utf-8")
+        if profile_file is not None:
+            (workspace_path / profile_file).write_text(artifact.analysis_text or "", encoding="utf-8")
+
+        entries.append(
+            {
+                "artifact_id": artifact.artifact_id,
+                "question": artifact.question,
+                "sql_file": sql_file,
+                "csv_file": csv_file,
+                "profile_file": profile_file,
+                "row_count": len(artifact.rows),
+                "column_count": len(artifact.columns),
+                "columns": list(artifact.columns),
+                "truncated": artifact.truncated,
+                "created_at": artifact.created_at,
+            }
+        )
+
+    manifest = {
+        "format_version": WORKSPACE_FORMAT_VERSION,
+        "app_version": _app_version(),
+        "created_at": utc_now(),
+        "artifact_count": len(artifacts),
+        "artifacts": entries,
+    }
+    (workspace_path / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return WorkspaceSaveResult(path=workspace_path, artifact_count=len(artifacts))
+
+
+def list_saved_workspaces(settings: Settings) -> tuple[Path, ...]:
+    """Workspace directories (those containing manifest.json) under OUTPUT_DIR/workspaces, newest first."""
+    workspaces_dir = settings.output_path / "workspaces"
+    if not workspaces_dir.exists():
+        return ()
+    dirs = [
+        path
+        for path in workspaces_dir.iterdir()
+        if path.is_dir() and (path / "manifest.json").is_file()
+    ]
+    dirs.sort(key=lambda path: (path.stat().st_mtime, path.name), reverse=True)
+    return tuple(dirs)
+
+
+def resolve_workspace_target(workspaces_dir: Path, target: str) -> Path:
+    """Resolve a bare workspace name (exact, else unique prefix) safely under workspaces_dir.
+
+    Absolute paths, path separators, and ``..`` are rejected, so resolution can never escape the
+    workspaces directory.
+    """
+    target = target.strip()
+    if not target:
+        raise AppError("Usage: :load <workspace>.")
+    if Path(target).is_absolute():
+        raise AppError("Workspace must be a name under the workspaces directory, not an absolute path.")
+    if "/" in target or "\\" in target or ".." in target:
+        raise AppError("Workspace must be a bare name under the workspaces directory.")
+    if not workspaces_dir.exists():
+        raise AppError(f"No workspace found: {target}")
+    candidates = [
+        path
+        for path in workspaces_dir.iterdir()
+        if path.is_dir() and (path / "manifest.json").is_file()
+    ]
+    exact = workspaces_dir / target
+    if exact.is_dir() and (exact / "manifest.json").is_file():
+        return exact
+    matches = sorted(
+        (path for path in candidates if path.name.startswith(target)), key=lambda path: path.name
+    )
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise AppError(f"No workspace found: {target}")
+    listed = "\n".join(f"- {path.name}" for path in matches)
+    raise AppError(f"Multiple workspaces match {target}. Use one of:\n{listed}")
+
+
+def load_artifact_workspace(settings: Settings, target: str) -> WorkspaceLoadResult:
+    """Reconstruct artifacts from a saved workspace. Loaded CSV cells are strings (CSV is untyped)."""
+    workspaces_dir = settings.output_path / "workspaces"
+    workspace_path = resolve_workspace_target(workspaces_dir, target)
+
+    try:
+        manifest = json.loads((workspace_path / "manifest.json").read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise AppError(f"Could not read workspace manifest: {exc}") from exc
+    entries = manifest.get("artifacts")
+    if not isinstance(entries, list):
+        raise AppError("Invalid workspace manifest: missing artifacts list.")
+
+    artifacts: list[ResultArtifact] = []
+    for entry in entries:
+        csv_file = entry.get("csv_file")
+        if not csv_file:
+            raise AppError("Invalid workspace manifest: artifact entry missing csv_file.")
+        try:
+            with (workspace_path / csv_file).open(newline="", encoding="utf-8") as handle:
+                table = list(csv.reader(handle))
+            sql_text = (workspace_path / entry["sql_file"]).read_text(encoding="utf-8")
+            profile_file = entry.get("profile_file")
+            analysis_text = (
+                (workspace_path / profile_file).read_text(encoding="utf-8")
+                if profile_file
+                else None
+            )
+        except (OSError, KeyError) as exc:
+            raise AppError(f"Could not read workspace artifact files: {exc}") from exc
+
+        columns = tuple(table[0]) if table else ()
+        rows = tuple(tuple(row) for row in table[1:])
+        artifacts.append(
+            ResultArtifact(
+                artifact_id=entry.get("artifact_id", len(artifacts) + 1),
+                question=entry.get("question", ""),
+                sql=sql_text,
+                columns=columns,
+                rows=rows,
+                truncated=bool(entry.get("truncated", False)),
+                analysis_text=analysis_text,
+                created_at=entry.get("created_at", ""),
+            )
+        )
+    return WorkspaceLoadResult(artifacts=tuple(artifacts), path=workspace_path)
+
+
 # --- v3.2: deterministic chart artifacts -----------------------------------------------
 
 _CHART_TYPES = ("bar", "line", "scatter", "hist")
@@ -2029,6 +2245,262 @@ def artifact_rows_as_dicts(artifact: ResultArtifact) -> list[dict[str, object]]:
     """
     names = make_unique_column_names(artifact.columns)
     return [dict(zip(names, row)) for row in artifact.rows]
+
+
+# --- v3.4: controlled artifact transformations -----------------------------------------
+
+_FILTER_OPS = ("eq", "ne", "gt", "gte", "lt", "lte", "contains")
+_GROUPBY_AGGS = ("sum", "mean", "count", "min", "max")
+_NUMERIC_AGGS = ("sum", "mean", "min", "max")
+
+
+def parse_transform_args(arg: str) -> dict[str, str]:
+    """Parse ``key=value`` transformation options. Thin wrapper over parse_key_value_args."""
+    return parse_key_value_args(arg)
+
+
+def _require_keys(
+    options: dict[str, str],
+    allowed: set[str],
+    *,
+    operation: str,
+    required: set[str] | None = None,
+) -> None:
+    """Reject unknown option keys and (optionally) flag missing required ones."""
+    unknown = sorted(set(options) - allowed)
+    if unknown:
+        raise AppError(f"Unknown option(s) for {operation}: {', '.join(unknown)}")
+    missing = sorted((required or set()) - set(options))
+    if missing:
+        raise AppError(f"Missing required option(s) for {operation}: {', '.join(missing)}")
+
+
+def _rows_from_dicts(
+    dict_rows: list[dict[str, object]], columns: Sequence[str]
+) -> tuple[tuple[object, ...], ...]:
+    """Project dict rows back into ordered tuple rows for the given columns."""
+    return tuple(tuple(row[column] for column in columns) for row in dict_rows)
+
+
+def _compare_values(cell: object, op: str, raw_value: str) -> bool:
+    """Deterministic comparison for :filter. No eval/exec; numeric when both sides convert."""
+    if op == "contains":
+        haystack = ("" if cell is None else str(cell)).lower()
+        return raw_value.lower() in haystack
+    if op in {"eq", "ne"}:
+        cell_number = _chart_numeric(cell)
+        value_number = _chart_numeric(raw_value)
+        if cell_number is not None and value_number is not None:
+            equal = cell_number == value_number
+        else:
+            equal = ("" if cell is None else str(cell)) == raw_value
+        return equal if op == "eq" else not equal
+    if op in {"gt", "gte", "lt", "lte"}:
+        cell_number = _chart_numeric(cell)
+        value_number = _chart_numeric(raw_value)
+        if cell_number is None or value_number is None:
+            return False
+        if op == "gt":
+            return cell_number > value_number
+        if op == "gte":
+            return cell_number >= value_number
+        if op == "lt":
+            return cell_number < value_number
+        return cell_number <= value_number
+    raise AppError(f"Unsupported filter op: {op}")
+
+
+def _transformed_artifact(
+    artifact_id: int,
+    question: str,
+    source: ResultArtifact,
+    columns: Sequence[str],
+    rows: tuple[tuple[object, ...], ...],
+    truncated: bool,
+) -> ResultArtifact:
+    """Build a new in-session artifact from a transformation (no analysis, fresh timestamp)."""
+    return ResultArtifact(
+        artifact_id=artifact_id,
+        question=question,
+        sql=source.sql,
+        columns=tuple(columns),
+        rows=rows,
+        truncated=truncated,
+        analysis_text=None,
+        created_at=utc_now(),
+    )
+
+
+def transform_artifact_sort(
+    artifact: ResultArtifact, arg: str, artifact_id: int
+) -> ArtifactTransformResult:
+    """Sort the latest artifact by a column; missing values always last (both directions)."""
+    options = parse_transform_args(arg)
+    _require_keys(options, {"column", "order"}, operation="sort", required={"column"})
+    order = options.get("order", "asc").lower()
+    if order not in {"asc", "desc"}:
+        raise AppError("Sort order must be 'asc' or 'desc'.")
+    names = make_unique_column_names(artifact.columns)
+    column = resolve_column(names, options["column"])
+    dict_rows = artifact_rows_as_dicts(artifact)
+
+    present = [row for row in dict_rows if row[column] is not None]
+    missing = [row for row in dict_rows if row[column] is None]
+    all_numeric = bool(present) and all(_chart_numeric(row[column]) is not None for row in present)
+    if all_numeric:
+        key = lambda row: _chart_numeric(row[column])  # noqa: E731
+    else:
+        key = lambda row: str(row[column])  # noqa: E731
+    ordered = sorted(present, key=key, reverse=(order == "desc")) + missing
+
+    rows = _rows_from_dicts(ordered, names)
+    new = _transformed_artifact(
+        artifact_id,
+        f"{artifact.question} [sort {column} {order}]",
+        artifact,
+        names,
+        rows,
+        artifact.truncated,
+    )
+    return ArtifactTransformResult(new, "sort", len(rows))
+
+
+def transform_artifact_select(
+    artifact: ResultArtifact, arg: str, artifact_id: int
+) -> ArtifactTransformResult:
+    """Project the latest artifact down to a subset of columns, preserving requested order."""
+    options = parse_transform_args(arg)
+    _require_keys(options, {"columns"}, operation="select", required={"columns"})
+    requested = [token.strip() for token in options["columns"].split(",") if token.strip()]
+    if not requested:
+        raise AppError("Select needs at least one column, e.g. columns=GenreName,TotalRevenue.")
+    names = make_unique_column_names(artifact.columns)
+    resolved = [resolve_column(names, token) for token in requested]
+    dict_rows = artifact_rows_as_dicts(artifact)
+
+    rows = _rows_from_dicts(dict_rows, resolved)
+    new = _transformed_artifact(
+        artifact_id,
+        f"{artifact.question} [select {','.join(resolved)}]",
+        artifact,
+        resolved,
+        rows,
+        artifact.truncated,
+    )
+    return ArtifactTransformResult(new, "select", len(rows))
+
+
+def transform_artifact_filter(
+    artifact: ResultArtifact, arg: str, artifact_id: int
+) -> ArtifactTransformResult:
+    """Keep rows matching a deterministic comparison over one column."""
+    options = parse_transform_args(arg)
+    _require_keys(
+        options, {"column", "op", "value"}, operation="filter", required={"column", "op", "value"}
+    )
+    op = options["op"].lower()
+    if op not in _FILTER_OPS:
+        raise AppError(f"Unsupported filter op: {op}")
+    value = options["value"]
+    if not value:
+        raise AppError("Filter value must not be empty.")
+    names = make_unique_column_names(artifact.columns)
+    column = resolve_column(names, options["column"])
+    dict_rows = artifact_rows_as_dicts(artifact)
+
+    kept = [row for row in dict_rows if _compare_values(row[column], op, value)]
+    rows = _rows_from_dicts(kept, names)
+    note = " [filter applied to truncated artifact]" if artifact.truncated else ""
+    new = _transformed_artifact(
+        artifact_id,
+        f"{artifact.question} [filter {column} {op} {value}]{note}",
+        artifact,
+        names,
+        rows,
+        False,
+    )
+    return ArtifactTransformResult(new, "filter", len(rows))
+
+
+def transform_artifact_groupby(
+    artifact: ResultArtifact, arg: str, artifact_id: int
+) -> ArtifactTransformResult:
+    """Group rows by one column and aggregate; deterministic group order by str(key)."""
+    options = parse_transform_args(arg)
+    _require_keys(options, {"by", "metric", "agg"}, operation="groupby", required={"by", "agg"})
+    agg = options["agg"].lower()
+    if agg not in _GROUPBY_AGGS:
+        raise AppError(f"Unsupported aggregation: {agg}")
+    if agg in _NUMERIC_AGGS and "metric" not in options:
+        raise AppError(f"Aggregation '{agg}' needs a metric=<column> option.")
+    names = make_unique_column_names(artifact.columns)
+    by_column = resolve_column(names, options["by"])
+    metric_column = resolve_column(names, options["metric"]) if "metric" in options else None
+    dict_rows = artifact_rows_as_dicts(artifact)
+
+    groups: dict[object, list[dict[str, object]]] = {}
+    for row in dict_rows:
+        groups.setdefault(row[by_column], []).append(row)
+
+    if agg == "count":
+        agg_column = "count"
+    else:
+        agg_column = f"{agg}_{metric_column}"
+
+    rows_out: list[tuple[object, object]] = []
+    for key in sorted(groups, key=lambda value: str(value)):
+        members = groups[key]
+        if agg == "count":
+            if metric_column is None:
+                aggregated: object = len(members)
+            else:
+                aggregated = sum(1 for row in members if row[metric_column] is not None)
+        else:
+            numbers = [
+                number
+                for row in members
+                if (number := _chart_numeric(row[metric_column])) is not None
+            ]
+            if not numbers:
+                aggregated = None
+            elif agg == "sum":
+                aggregated = sum(numbers)
+            elif agg == "mean":
+                aggregated = sum(numbers) / len(numbers)
+            elif agg == "min":
+                aggregated = min(numbers)
+            else:
+                aggregated = max(numbers)
+        rows_out.append((key, aggregated))
+
+    columns = (by_column, agg_column)
+    rows = tuple(rows_out)
+    note = " [groupby applied to truncated artifact]" if artifact.truncated else ""
+    metric_text = f" {metric_column}" if metric_column is not None else ""
+    new = _transformed_artifact(
+        artifact_id,
+        f"{artifact.question} [groupby {by_column} {agg}{metric_text}]{note}",
+        artifact,
+        columns,
+        rows,
+        False,
+    )
+    return ArtifactTransformResult(new, "groupby", len(rows))
+
+
+def transform_artifact(
+    artifact: ResultArtifact, operation: str, arg: str, artifact_id: int
+) -> ArtifactTransformResult:
+    """Dispatch a transformation command to its deterministic handler."""
+    if operation == "sort":
+        return transform_artifact_sort(artifact, arg, artifact_id)
+    if operation == "select":
+        return transform_artifact_select(artifact, arg, artifact_id)
+    if operation == "filter":
+        return transform_artifact_filter(artifact, arg, artifact_id)
+    if operation == "groupby":
+        return transform_artifact_groupby(artifact, arg, artifact_id)
+    raise AppError(f"Unsupported transformation: {operation}")
 
 
 def _next_chart_path(charts_dir: Path) -> Path:
@@ -2177,6 +2649,134 @@ def export_artifact_chart(settings: Settings, artifact: ResultArtifact, arg: str
     )
 
 
+_SORT_DIRECTIONS = {"asc": "asc", "desc": "desc", "ascending": "asc", "descending": "desc"}
+_GROUPBY_AGG_PHRASES = {
+    "sum": "sum",
+    "mean": "mean",
+    "average": "mean",
+    "min": "min",
+    "max": "max",
+}
+_FILTER_OP_PHRASES = {  # lowercased op phrase -> canonical op
+    "eq": "eq",
+    "equals": "eq",
+    "equal to": "eq",
+    "is": "eq",
+    "ne": "ne",
+    "not equals": "ne",
+    "not equal to": "ne",
+    "is not": "ne",
+    "gt": "gt",
+    "greater than": "gt",
+    "above": "gt",
+    "more than": "gt",
+    "gte": "gte",
+    "at least": "gte",
+    "greater than or equal to": "gte",
+    "lt": "lt",
+    "less than": "lt",
+    "below": "lt",
+    "under": "lt",
+    "lte": "lte",
+    "at most": "lte",
+    "less than or equal to": "lte",
+    "contains": "contains",
+    "including": "contains",
+}
+
+
+def _canonical_route_column(names: tuple[str, ...], token: str) -> str:
+    """Resolve a routed column token to its canonical artifact name (raises if unknown)."""
+    return resolve_column(names, token.strip("?.!"))
+
+
+def _route_sort_followup(text: str, names: tuple[str, ...]) -> RoutedArtifactCommand | None:
+    """Route 'sort by <col> [dir]' / 'order by <col> [dir]' / 'sort <col> [dir]'."""
+    match = re.match(r"(?:sort by|order by|sort)\s+(.+)", text, re.IGNORECASE)
+    if match is None:
+        return None
+    tokens = match.group(1).strip().split(" ")
+    if len(tokens) == 1:
+        column_token, order = tokens[0], "asc"
+    elif len(tokens) == 2:
+        order = _SORT_DIRECTIONS.get(tokens[1].lower())
+        if order is None:
+            return None
+        column_token = tokens[0]
+    else:
+        return None
+    column = _canonical_route_column(names, column_token)
+    return RoutedArtifactCommand("sort", f"column={column} order={order}", "sort")
+
+
+def _route_select_followup(text: str, names: tuple[str, ...]) -> RoutedArtifactCommand | None:
+    """Route 'select <c1,c2>' / 'only columns <...>' / 'show only <...>' / 'only show <...>'."""
+    match = re.match(r"(select|only columns|only show|show only)\s+(.+)", text, re.IGNORECASE)
+    if match is None:
+        return None
+    prefix = match.group(1).lower()
+    remainder = match.group(2).strip()
+    # Bare-select guard: a comma is required unless the prefix is explicitly "only columns",
+    # so SQL-like phrasing ("select customers") is not hijacked as a projection.
+    if prefix != "only columns" and "," not in remainder:
+        return None
+    tokens = [token.strip() for token in remainder.split(",")]
+    tokens = [token for token in tokens if token]
+    if not tokens:
+        return None
+    if any(" " in token for token in tokens):
+        return None
+    resolved = [_canonical_route_column(names, token) for token in tokens]
+    return RoutedArtifactCommand("select", f"columns={','.join(resolved)}", "select")
+
+
+def _route_filter_followup(text: str, names: tuple[str, ...]) -> RoutedArtifactCommand | None:
+    """Route 'filter|where|keep rows where <col> <op-phrase> <single-token-value>'."""
+    match = re.match(r"(?:keep rows where|where|filter)\s+(.+)", text, re.IGNORECASE)
+    if match is None:
+        return None
+    tokens = match.group(1).strip().split(" ")
+    if len(tokens) < 3:
+        return None
+    column_token = tokens[0]
+    value = tokens[-1]
+    op = _FILTER_OP_PHRASES.get(" ".join(tokens[1:-1]).lower())
+    if op is None:  # validated before resolving the column, so non-filter prose returns None
+        return None
+    if not value:
+        return None
+    column = _canonical_route_column(names, column_token)
+    return RoutedArtifactCommand("filter", f"column={column} op={op} value={value}", "filter")
+
+
+def _route_groupby_followup(text: str, names: tuple[str, ...]) -> RoutedArtifactCommand | None:
+    """Route 'count by <col>' and 'group by <col> [count | <agg> <metric>]'."""
+    count_match = re.match(r"count by\s+(.+)", text, re.IGNORECASE)
+    if count_match is not None:
+        tokens = count_match.group(1).strip().split(" ")
+        if len(tokens) != 1:
+            return None
+        by_column = _canonical_route_column(names, tokens[0])
+        return RoutedArtifactCommand("groupby", f"by={by_column} agg=count", "groupby")
+    match = re.match(r"group by\s+(.+)", text, re.IGNORECASE)
+    if match is None:
+        return None
+    tokens = match.group(1).strip().split(" ")
+    if len(tokens) == 2 and tokens[1].lower() == "count":
+        by_column = _canonical_route_column(names, tokens[0])
+        return RoutedArtifactCommand("groupby", f"by={by_column} agg=count", "groupby")
+    if len(tokens) == 3:
+        agg = _GROUPBY_AGG_PHRASES.get(tokens[1].lower())
+        if agg is None:
+            return None
+        by_column = _canonical_route_column(names, tokens[0])
+        metric_column = _canonical_route_column(names, tokens[2])
+        return RoutedArtifactCommand(
+            "groupby", f"by={by_column} metric={metric_column} agg={agg}", "groupby"
+        )
+    return None
+
+
 def route_artifact_followup(text: str, columns: Sequence[str]) -> RoutedArtifactCommand | None:
     """Map a natural-language follow-up to an existing artifact command, deterministically.
 
@@ -2185,10 +2785,12 @@ def route_artifact_followup(text: str, columns: Sequence[str]) -> RoutedArtifact
     never calls the model, generates code, or runs SQL. Only the chart-resolution path may raise
     AppError (unknown/ambiguous column); every other family returns a command or None.
     """
-    norm = re.sub(r"\s+", " ", text.strip().lower())
+    collapsed = re.sub(r"\s+", " ", text.strip())
+    norm = collapsed.lower()
     if not norm:
         return None
     core_text = norm.rstrip("?.!").strip()
+    core_collapsed = collapsed.rstrip("?.!").strip()  # case-preserving (filter values keep case)
 
     # A. describe (deterministic profile -- intentionally not "summarize this result")
     if core_text in {
@@ -2249,6 +2851,20 @@ def route_artifact_followup(text: str, columns: Sequence[str]) -> RoutedArtifact
     ):
         return RoutedArtifactCommand("artifacts", "", "artifacts")
 
+    names = make_unique_column_names(tuple(columns))
+
+    # Transformation routes (v3.5): sort / select / filter / groupby over the latest artifact.
+    # Conservative, case-preserving; each returns None when the phrase is not clearly its command.
+    for transform_router in (
+        _route_sort_followup,
+        _route_select_followup,
+        _route_filter_followup,
+        _route_groupby_followup,
+    ):
+        routed = transform_router(core_collapsed, names)
+        if routed is not None:
+            return routed
+
     # H. plot (checked last; requires explicit options, else None)
     if re.search(r"\b(?:plot\s+bar|bar\s+chart)\b", norm):
         chart_type = "bar"
@@ -2261,7 +2877,6 @@ def route_artifact_followup(text: str, columns: Sequence[str]) -> RoutedArtifact
     else:
         return None
 
-    names = make_unique_column_names(tuple(columns))
     if chart_type == "hist":
         column_match = (
             re.search(r"column=(\S+)", norm)
@@ -2736,3 +3351,243 @@ def verify_northwind_database(path: Path) -> int:
             + ", ".join(sorted(missing))
         )
     return len(tables)
+
+
+def _next_report_path(base_dir: Path, suffix: str) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dot_suffix = suffix if suffix.startswith(".") else f".{suffix}"
+    base_name = f"report_{timestamp}"
+    path = base_dir / f"{base_name}{dot_suffix}"
+    if not path.exists():
+        return path
+    counter = 2
+    while True:
+        path = base_dir / f"{base_name}_{counter}{dot_suffix}"
+        if not path.exists():
+            return path
+        counter += 1
+
+
+def _markdown_fence(text: str, language: str = "") -> str:
+    fence = "```"
+    while fence in text:
+        fence += "`"
+    suffix = language if language else ""
+    return f"{fence}{suffix}\n{text}\n{fence}"
+
+
+def render_artifact_report_markdown(
+    artifacts: Sequence[ResultArtifact],
+    *,
+    title: str = "Artifact Report",
+    max_preview_rows: int = 50,
+) -> str:
+    if not artifacts:
+        raise AppError("No artifacts to report.")
+
+    report_time = utc_now()
+
+    lines = []
+    lines.append(f"# {title}")
+    lines.append("")
+    lines.append(f"- **Created**: {report_time}")
+    lines.append(f"- **Artifacts**: {len(artifacts)}")
+    lines.append("")
+    lines.append("> [!NOTE]")
+    lines.append("> Report uses stored artifact rows only. No SQL was re-run.")
+    lines.append("")
+
+    def escape_md_cell(val: Any) -> str:
+        if val is None:
+            return ""
+        if isinstance(val, (bytes, bytearray, memoryview)):
+            return "<binary>"
+        return str(val).replace("|", "\\|")
+
+    for art in artifacts:
+        lines.append("---")
+        lines.append("")
+        lines.append(f"## Artifact #{art.artifact_id}")
+        lines.append("")
+        lines.append(f"- **Created**: {art.created_at}")
+        lines.append(f"- **Question**: {art.question}")
+        lines.append(f"- **SQL Truncated**: {'yes' if art.truncated else 'no'}")
+        lines.append(f"- **Columns**: {', '.join(art.columns)}")
+        lines.append(f"- **Total Rows**: {len(art.rows)}")
+        lines.append("")
+
+        lines.append("### SQL")
+        lines.append(_markdown_fence(art.sql, "sql"))
+        lines.append("")
+
+        lines.append("### Preview")
+        if art.columns:
+            headers = " | ".join(escape_md_cell(col) for col in art.columns)
+            sep = " | ".join("---" for _ in art.columns)
+            lines.append(f"| {headers} |")
+            lines.append(f"| {sep} |")
+            for row in art.rows[:max_preview_rows]:
+                row_str = " | ".join(escape_md_cell(val) for val in row)
+                lines.append(f"| {row_str} |")
+        else:
+            lines.append("No columns.")
+        lines.append("")
+
+        if len(art.rows) > max_preview_rows:
+            lines.append(f"Showing first {max_preview_rows} of {len(art.rows)} stored rows.")
+            lines.append("")
+
+        if art.analysis_text:
+            lines.append("### Analysis")
+            lines.append(_markdown_fence(art.analysis_text))
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+def render_artifact_report_html(
+    artifacts: Sequence[ResultArtifact],
+    *,
+    title: str = "Artifact Report",
+    max_preview_rows: int = 50,
+) -> str:
+    if not artifacts:
+        raise AppError("No artifacts to report.")
+
+    import html
+
+    report_time = utc_now()
+
+    def escape_html_val(val: Any) -> str:
+        if val is None:
+            return ""
+        if isinstance(val, (bytes, bytearray, memoryview)):
+            return "<binary>"
+        return html.escape(str(val))
+
+    html_parts = []
+    html_parts.append("<!DOCTYPE html>")
+    html_parts.append("<html>")
+    html_parts.append("<head>")
+    html_parts.append('  <meta charset="utf-8">')
+    html_parts.append(f"  <title>{html.escape(title)}</title>")
+    html_parts.append("  <style>")
+    html_parts.append("    body { font-family: sans-serif; margin: 20px; line-height: 1.5; color: #333; }")
+    html_parts.append("    h1 { border-bottom: 2px solid #eee; padding-bottom: 10px; }")
+    html_parts.append("    .warning-note { background-color: #fff3cd; border: 1px solid #ffeeba; color: #856404; padding: 10px; border-radius: 4px; margin-bottom: 20px; }")
+    html_parts.append("    section { border: 1px solid #ccc; padding: 20px; margin-bottom: 20px; border-radius: 5px; }")
+    html_parts.append("    table { border-collapse: collapse; width: 100%; margin: 10px 0; }")
+    html_parts.append("    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }")
+    html_parts.append("    th { background-color: #f5f5f5; }")
+    html_parts.append("    pre { background-color: #f9f9f9; padding: 10px; border: 1px solid #eee; overflow-x: auto; }")
+    html_parts.append("    code { font-family: monospace; }")
+    html_parts.append("  </style>")
+    html_parts.append("</head>")
+    html_parts.append("<body>")
+    html_parts.append(f"  <h1>{html.escape(title)}</h1>")
+    html_parts.append(f"  <p><strong>Created:</strong> {html.escape(report_time)}</p>")
+    html_parts.append(f"  <p><strong>Artifacts:</strong> {len(artifacts)}</p>")
+    html_parts.append('  <div class="warning-note">Report uses stored artifact rows only. No SQL was re-run.</div>')
+
+    for art in artifacts:
+        html_parts.append("  <section>")
+        html_parts.append(f"    <h2>Artifact #{art.artifact_id}</h2>")
+        html_parts.append(f"    <p><strong>Created:</strong> {html.escape(art.created_at)}</p>")
+        html_parts.append(f"    <p><strong>Question:</strong> {html.escape(art.question)}</p>")
+        html_parts.append(f"    <p><strong>SQL Truncated:</strong> {html.escape('yes' if art.truncated else 'no')}</p>")
+        html_parts.append(f"    <p><strong>Columns:</strong> {html.escape(', '.join(art.columns))}</p>")
+        html_parts.append(f"    <p><strong>Total Rows:</strong> {len(art.rows)}</p>")
+
+        html_parts.append("    <h3>SQL</h3>")
+        html_parts.append(f"    <pre><code>{html.escape(art.sql)}</code></pre>")
+
+        html_parts.append("    <h3>Preview</h3>")
+        if art.columns:
+            html_parts.append("    <table>")
+            html_parts.append("      <thead>")
+            html_parts.append("        <tr>")
+            for col in art.columns:
+                html_parts.append(f"          <th>{html.escape(col)}</th>")
+            html_parts.append("        </tr>")
+            html_parts.append("      </thead>")
+            html_parts.append("      <tbody>")
+            for row in art.rows[:max_preview_rows]:
+                html_parts.append("        <tr>")
+                for val in row:
+                    html_parts.append(f"          <td>{escape_html_val(val)}</td>")
+                html_parts.append("        </tr>")
+            html_parts.append("      </tbody>")
+            html_parts.append("    </table>")
+        else:
+            html_parts.append("    <p>No columns.</p>")
+
+        if len(art.rows) > max_preview_rows:
+            html_parts.append(f"    <p>Showing first {max_preview_rows} of {len(art.rows)} stored rows.</p>")
+
+        if art.analysis_text:
+            html_parts.append("    <h3>Analysis</h3>")
+            html_parts.append(f"    <pre><code>{html.escape(art.analysis_text)}</code></pre>")
+
+        html_parts.append("  </section>")
+
+    html_parts.append("</body>")
+    html_parts.append("</html>")
+    return "\n".join(html_parts)
+
+
+def export_artifact_report(
+    settings,
+    artifacts: Sequence[ResultArtifact],
+    *,
+    report_format: str,
+    include_all: bool = False,
+) -> ReportExportResult:
+    fmt = report_format.strip().lower()
+    if fmt in {"md", "markdown"}:
+        normalized_format = "markdown"
+        suffix = "md"
+    elif fmt == "html":
+        normalized_format = "html"
+        suffix = "html"
+    else:
+        raise AppError(f"Unsupported report format: {report_format}")
+
+    if not artifacts:
+        raise AppError("No artifacts to report.")
+
+    to_report = artifacts if include_all else [artifacts[-1]]
+
+    reports_dir = Path(settings.output_path) / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    file_path = _next_report_path(reports_dir, suffix)
+
+    if normalized_format == "markdown":
+        content = render_artifact_report_markdown(to_report)
+    else:
+        content = render_artifact_report_html(to_report)
+
+    file_path.write_text(content, encoding="utf-8")
+
+    return ReportExportResult(
+        path=file_path,
+        artifact_count=len(to_report),
+        format=normalized_format,
+    )
+
+
+def export_workspace_report(
+    settings,
+    workspace_target: str,
+    *,
+    report_format: str,
+) -> ReportExportResult:
+    loaded = load_artifact_workspace(settings, workspace_target)
+    return export_artifact_report(
+        settings,
+        loaded.artifacts,
+        report_format=report_format,
+        include_all=True,
+    )
+
+

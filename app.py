@@ -24,12 +24,19 @@ from core import (
     download_northwind,
     export_artifact_chart,
     export_artifact_csv,
+    export_artifact_report,
+    export_workspace_report,
     index_schema,
+    list_saved_workspaces,
+    load_artifact_workspace,
     make_result_artifact,
     parse_colon_command,
     parse_count,
+    parse_key_value_args,
     read_query_logs,
     route_artifact_followup,
+    save_artifact_workspace,
+    transform_artifact,
     verify_sqlite_database,
 )
 
@@ -43,7 +50,15 @@ ARTIFACT_HELP = """Artifact commands (operate on the last result):
   :head [N]      Show the first N rows (default 10)
   :tail [N]      Show the last N rows (default 10)
   :export [csv]  Export the result to OUTPUT_DIR as CSV
+  :report <md|html> [all|workspace=<target>]   Export artifact report
   :plot ...      Save a chart to OUTPUT_DIR/charts (bar/line/scatter x=.. y=.. | hist column=..)
+  :sort ...      New artifact sorted by a column (column=<c> order=<asc|desc>)
+  :select ...    New artifact with a subset of columns (columns=<c1,c2,...>)
+  :filter ...    New filtered artifact (column=<c> op=<eq|ne|gt|gte|lt|lte|contains> value=<v>)
+  :groupby ...   New aggregated artifact (by=<c> metric=<c> agg=<sum|mean|count|min|max>)
+  :save [name=<name>]  Save this session's artifacts to OUTPUT_DIR/workspaces
+  :saved         List saved workspaces
+  :load <workspace>    Load a saved workspace (exact name or unique prefix)
   :artifacts     List this session's results
   :help          Show this help
   :q             Quit"""
@@ -263,6 +278,102 @@ def handle_artifact_command(
     if name == "artifacts":
         render_artifacts(artifacts)
         return
+    if name == "save":
+        try:
+            options = parse_key_value_args(arg)
+            unknown = set(options) - {"name"}
+            if unknown:
+                raise AppError(f"Unknown option(s) for save: {', '.join(sorted(unknown))}")
+            saved = save_artifact_workspace(settings, artifacts, name=options.get("name"))
+        except AppError as exc:
+            console.print(Panel(str(exc), title="Save failed", border_style="yellow"))
+            return
+        console.print(f"[green]Saved[/green] {saved.artifact_count} artifacts to {saved.path}")
+        return
+    if name == "saved":
+        workspaces = list_saved_workspaces(settings)
+        if not workspaces:
+            console.print("No saved workspaces.")
+            return
+        table = Table(title=f"{len(workspaces)} saved workspace(s)")
+        table.add_column("Name")
+        table.add_column("Path")
+        for path in workspaces:
+            table.add_row(path.name, str(path))
+        console.print(table)
+        return
+    if name == "load":
+        target = arg.strip()
+        if not target:
+            console.print(Panel("Usage: :load <workspace>", title="Load", border_style="yellow"))
+            return
+        try:
+            loaded = load_artifact_workspace(settings, target)
+        except AppError as exc:
+            console.print(Panel(str(exc), title="Load failed", border_style="yellow"))
+            return
+        artifacts[:] = list(loaded.artifacts)
+        console.print(
+            f"[green]Loaded[/green] {len(loaded.artifacts)} artifacts from {loaded.path}"
+        )
+        return
+    if name == "report":
+        try:
+            tokens = arg.split()
+            if not tokens:
+                raise AppError("Missing report format. Use :report <md|html> [all] [workspace=<workspace>]")
+            if len(tokens) > 2:
+                raise AppError("Too many arguments for report. Use :report <md|html> [all] [workspace=<workspace>]")
+
+            format_str = tokens[0]
+            fmt_lower = format_str.strip().lower()
+            if fmt_lower not in {"md", "markdown", "html"}:
+                raise AppError(f"Unsupported report format: {format_str}")
+
+            include_all = False
+            workspace_target = None
+
+            if len(tokens) == 2:
+                opt = tokens[1]
+                if opt == "all":
+                    include_all = True
+                elif opt.startswith("workspace="):
+                    _, _, target = opt.partition("=")
+                    target = target.strip()
+                    if not target:
+                        raise AppError("Empty workspace target. Use workspace=<workspace-name-or-prefix>")
+                    workspace_target = target
+                else:
+                    raise AppError(f"Unknown option for report: {opt}")
+
+            if workspace_target is not None:
+                result = export_workspace_report(
+                    settings,
+                    workspace_target,
+                    report_format=format_str,
+                )
+                console.print(
+                    f"Saved {result.format} report for {result.artifact_count} workspace artifact(s) to {result.path}"
+                )
+                return
+
+            if not artifacts:
+                console.print("No result yet — ask a question first.")
+                return
+
+            result = export_artifact_report(
+                settings,
+                artifacts,
+                report_format=format_str,
+                include_all=include_all,
+            )
+            suffix_s = "s" if result.artifact_count != 1 else ""
+            console.print(
+                f"Saved {result.format} report for {result.artifact_count} artifact{suffix_s} to {result.path}"
+            )
+        except AppError as exc:
+            console.print(Panel(str(exc), title="Report failed", border_style="yellow"))
+        return
     if not artifacts:
         console.print("No result yet — ask a question first.")
         return
@@ -312,6 +423,18 @@ def handle_artifact_command(
             return
         console.print(f"[green]Saved chart[/green] {chart.path}")
         console.print(f"Chart type: {chart.chart_type}; rows plotted: {chart.row_count}")
+    elif name in {"sort", "select", "filter", "groupby"}:
+        try:
+            transformed = transform_artifact(last, name, arg, len(artifacts) + 1)
+        except AppError as exc:
+            console.print(Panel(str(exc), title="Transform failed", border_style="yellow"))
+            return
+        new = transformed.artifact
+        artifacts.append(new)
+        console.print(
+            f"[green]Created artifact #{new.artifact_id}[/green] with {transformed.row_count} rows."
+        )
+        render_rows(new.columns, new.rows[:10], truncated=False)
     else:
         console.print(Panel(ARTIFACT_HELP, title=f"Unknown command :{name}"))
 

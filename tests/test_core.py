@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -43,13 +44,25 @@ from core import (
     make_result_artifact,
     make_unique_column_names,
     metadata_connection,
+    ArtifactTransformResult,
     RoutedArtifactCommand,
+    _compare_values,
     parse_colon_command,
     parse_count,
     parse_key_value_args,
     parse_plot_command_args,
+    parse_transform_args,
     resolve_column,
     route_artifact_followup,
+    list_saved_workspaces,
+    load_artifact_workspace,
+    sanitize_workspace_name,
+    save_artifact_workspace,
+    transform_artifact,
+    transform_artifact_filter,
+    transform_artifact_groupby,
+    transform_artifact_select,
+    transform_artifact_sort,
     profile_result_dataframe,
     quote_guidance,
     quote_identifier,
@@ -1571,3 +1584,551 @@ def test_route_returns_none_for_vague_and_db_questions() -> None:
         "summarize this result",
     ):
         assert route_artifact_followup(text, _ROUTER_COLUMNS) is None
+
+
+# --- v3.5: natural-language routing for artifact transformations -----------------------
+
+_TRANSFORM_COLUMNS = ("GenreName", "TotalRevenue", "TrackCount", "Country", "Revenue")
+
+
+def _route(text: str, columns: tuple[str, ...] = _TRANSFORM_COLUMNS) -> tuple[str, str]:
+    route = route_artifact_followup(text, columns)
+    assert route is not None
+    return route.command, route.arg
+
+
+def test_route_sort_followups() -> None:
+    assert _route("sort by TotalRevenue descending") == ("sort", "column=TotalRevenue order=desc")
+    assert _route("order by TrackCount") == ("sort", "column=TrackCount order=asc")
+    assert route_artifact_followup("sort countries by revenue", _TRANSFORM_COLUMNS) is None
+    with pytest.raises(AppError):
+        route_artifact_followup("sort by Missing", _TRANSFORM_COLUMNS)
+
+
+def test_route_select_followups() -> None:
+    assert _route("select GenreName, TotalRevenue") == ("select", "columns=GenreName,TotalRevenue")
+    assert _route("only columns GenreName,TrackCount") == ("select", "columns=GenreName,TrackCount")
+    assert _route("only columns GenreName") == ("select", "columns=GenreName")
+    with pytest.raises(AppError):
+        route_artifact_followup("select Missing, TotalRevenue", _TRANSFORM_COLUMNS)
+    # bare-select guard: no comma -> not routed (never raises), so SQL-like phrasing is safe
+    assert route_artifact_followup("show only high revenue genres", _TRANSFORM_COLUMNS) is None
+    assert route_artifact_followup("select GenreName", _TRANSFORM_COLUMNS) is None
+    assert route_artifact_followup("select customers", _TRANSFORM_COLUMNS) is None
+
+
+def test_route_filter_followups() -> None:
+    assert _route("filter TotalRevenue greater than 100") == (
+        "filter",
+        "column=TotalRevenue op=gt value=100",
+    )
+    assert _route("where GenreName contains Rock") == (
+        "filter",
+        "column=GenreName op=contains value=Rock",
+    )
+    assert _route("keep rows where TrackCount at least 100") == (
+        "filter",
+        "column=TrackCount op=gte value=100",
+    )
+    with pytest.raises(AppError):
+        route_artifact_followup("filter Missing greater than 100", _TRANSFORM_COLUMNS)
+    # value has spaces -> not routed; non-filter prose starting with "where" -> not routed
+    assert (
+        route_artifact_followup("where GenreName contains Alternative Rock", _TRANSFORM_COLUMNS)
+        is None
+    )
+    assert route_artifact_followup("where are the customers from USA", _TRANSFORM_COLUMNS) is None
+
+
+def test_route_groupby_followups() -> None:
+    assert _route("count by Country") == ("groupby", "by=Country agg=count")
+    assert _route("group by Country sum Revenue") == (
+        "groupby",
+        "by=Country metric=Revenue agg=sum",
+    )
+    assert _route("group by Country average Revenue") == (
+        "groupby",
+        "by=Country metric=Revenue agg=mean",
+    )
+    with pytest.raises(AppError):
+        route_artifact_followup("group by Missing sum Revenue", _TRANSFORM_COLUMNS)
+    assert route_artifact_followup("summarize revenue by country", _TRANSFORM_COLUMNS) is None
+    assert route_artifact_followup("sales by country", _TRANSFORM_COLUMNS) is None
+
+
+def test_route_transform_ambiguous_column_raises() -> None:
+    with pytest.raises(AppError):
+        route_artifact_followup("sort by name", ("Name", "NAME"))
+
+
+# --- v3.6: persistent artifact workspace -----------------------------------------------
+
+
+def _workspace_settings(tmp_path: Path) -> Settings:
+    return Settings(
+        omlx_api_key="test",
+        db_path=tmp_path / "x.db",
+        metadata_db_path=tmp_path / "m.db",
+        output_dir=tmp_path / "outputs",
+    )
+
+
+def _genre_rows_artifact(**overrides: object) -> ResultArtifact:
+    return _make_artifact(
+        (("Rock", 826.65, 835), ("Latin", 382.14, 579)),
+        sql="SELECT GenreName, TotalRevenue, TrackCount FROM t",
+        columns=("GenreName", "TotalRevenue", "TrackCount"),
+        **overrides,
+    )
+
+
+def test_sanitize_workspace_name_rules() -> None:
+    assert sanitize_workspace_name("my analysis!") == "my_analysis_"
+    assert sanitize_workspace_name("abc-123_DEF") == "abc-123_DEF"
+    for bad in ("", "   ", "!!!"):
+        with pytest.raises(AppError):
+            sanitize_workspace_name(bad)
+
+
+def test_save_workspace_requires_artifacts(tmp_path: Path) -> None:
+    with pytest.raises(AppError):
+        save_artifact_workspace(_workspace_settings(tmp_path), [])
+
+
+def test_save_workspace_writes_files_and_manifest(tmp_path: Path) -> None:
+    settings = _workspace_settings(tmp_path)
+    artifact = _genre_rows_artifact(analysis_text="Rows profiled: 2, Columns: 3")
+    result = save_artifact_workspace(settings, [artifact], name="genre_revenue")
+    assert result.artifact_count == 1
+    assert (result.path / "manifest.json").is_file()
+    assert (result.path / "artifact_001.csv").is_file()
+    assert (result.path / "artifact_001.sql").is_file()
+    assert (result.path / "artifact_001_profile.txt").is_file()
+
+    manifest = json.loads((result.path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["format_version"] == 1
+    assert manifest["artifact_count"] == 1
+    assert "app_version" in manifest and "created_at" in manifest
+    entry = manifest["artifacts"][0]
+    assert entry["columns"] == ["GenreName", "TotalRevenue", "TrackCount"]
+    assert entry["row_count"] == 2
+    assert entry["truncated"] is False
+    assert entry["profile_file"] == "artifact_001_profile.txt"
+
+
+def test_save_workspace_without_analysis_skips_profile(tmp_path: Path) -> None:
+    settings = _workspace_settings(tmp_path)
+    result = save_artifact_workspace(settings, [_genre_rows_artifact()])
+    assert not (result.path / "artifact_001_profile.txt").exists()
+    manifest = json.loads((result.path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["artifacts"][0]["profile_file"] is None
+
+
+def test_save_workspace_creates_distinct_paths(tmp_path: Path) -> None:
+    settings = _workspace_settings(tmp_path)
+    first = save_artifact_workspace(settings, [_genre_rows_artifact()], name="genre_revenue")
+    second = save_artifact_workspace(settings, [_genre_rows_artifact()], name="genre_revenue")
+    assert first.path != second.path
+
+
+def test_list_saved_workspaces_ignores_dirs_without_manifest(tmp_path: Path) -> None:
+    settings = _workspace_settings(tmp_path)
+    saved = save_artifact_workspace(settings, [_genre_rows_artifact()], name="alpha")
+    (settings.output_path / "workspaces" / "not_a_workspace").mkdir()
+    listed = list_saved_workspaces(settings)
+    assert saved.path in listed
+    assert all(path.name != "not_a_workspace" for path in listed)
+
+
+def test_load_workspace_round_trips(tmp_path: Path) -> None:
+    settings = _workspace_settings(tmp_path)
+    source = _genre_rows_artifact(truncated=True)
+    saved = save_artifact_workspace(settings, [source], name="genre_revenue")
+
+    loaded = load_artifact_workspace(settings, saved.path.name)
+    assert len(loaded.artifacts) == 1
+    restored = loaded.artifacts[0]
+    assert restored.columns == ("GenreName", "TotalRevenue", "TrackCount")
+    # CSV cannot preserve types: every loaded cell is a string
+    assert restored.rows[0] == ("Rock", "826.65", "835")
+    assert all(isinstance(value, str) for row in restored.rows for value in row)
+    assert restored.sql == source.sql
+    assert restored.question == source.question
+    assert restored.truncated is True
+    assert restored.created_at == source.created_at
+    assert restored.artifact_id == source.artifact_id
+
+
+def test_load_workspace_unique_prefix(tmp_path: Path) -> None:
+    settings = _workspace_settings(tmp_path)
+    save_artifact_workspace(settings, [_genre_rows_artifact()], name="uniquename")
+    loaded = load_artifact_workspace(settings, "uniquename")
+    assert len(loaded.artifacts) == 1
+
+
+def test_load_workspace_ambiguous_prefix_raises(tmp_path: Path) -> None:
+    settings = _workspace_settings(tmp_path)
+    save_artifact_workspace(settings, [_genre_rows_artifact()], name="genre_revenue")
+    save_artifact_workspace(settings, [_genre_rows_artifact()], name="genre_revenue")
+    with pytest.raises(AppError, match="Multiple workspaces match"):
+        load_artifact_workspace(settings, "genre_revenue")
+
+
+def test_load_workspace_rejects_unknown_traversal_and_absolute(tmp_path: Path) -> None:
+    settings = _workspace_settings(tmp_path)
+    save_artifact_workspace(settings, [_genre_rows_artifact()], name="genre_revenue")
+    with pytest.raises(AppError):
+        load_artifact_workspace(settings, "does_not_exist")
+    with pytest.raises(AppError):
+        load_artifact_workspace(settings, "../outside")
+    with pytest.raises(AppError):
+        load_artifact_workspace(settings, str(tmp_path))
+
+
+# --- v3.4: controlled artifact transformations -----------------------------------------
+
+
+def _genre_artifact(**overrides: object) -> ResultArtifact:
+    return _make_artifact(
+        (
+            ("Rock", 826.65, 835),
+            ("Latin", 382.14, 579),
+            ("Jazz", 79.2, 130),
+            ("Empty", None, 0),
+        ),
+        sql="SELECT g.Name AS GenreName, SUM(x) AS TotalRevenue, COUNT(*) AS TrackCount FROM t",
+        columns=("GenreName", "TotalRevenue", "TrackCount"),
+        **overrides,
+    )
+
+
+def _country_artifact(**overrides: object) -> ResultArtifact:
+    return _make_artifact(
+        (("USA", 10), ("USA", 15), ("India", 7), ("India", None)),
+        sql="SELECT Country, Revenue FROM t",
+        columns=("Country", "Revenue"),
+        **overrides,
+    )
+
+
+def test_parse_transform_args_rules() -> None:
+    assert parse_transform_args("column=TotalRevenue order=desc") == {
+        "column": "TotalRevenue",
+        "order": "desc",
+    }
+    assert parse_transform_args("") == {}
+    with pytest.raises(AppError):
+        parse_transform_args("column")
+    with pytest.raises(AppError):
+        parse_transform_args("column=A column=B")
+
+
+def test_compare_values_numeric_and_contains() -> None:
+    assert _compare_values(100, "eq", "100.0") is True
+    assert _compare_values("Rock", "contains", "ROCK") is True
+    assert _compare_values("Rock", "gt", "100") is False  # non-numeric cell
+
+
+def test_transform_sort_desc_and_asc_put_missing_last() -> None:
+    artifact = _genre_artifact()
+    desc = transform_artifact_sort(artifact, "column=TotalRevenue order=desc", 2).artifact
+    assert [row[0] for row in desc.rows] == ["Rock", "Latin", "Jazz", "Empty"]
+    asc = transform_artifact_sort(artifact, "column=TotalRevenue order=asc", 2).artifact
+    assert [row[0] for row in asc.rows] == ["Jazz", "Latin", "Rock", "Empty"]
+
+
+def test_transform_sort_rejects_bad_column_and_order() -> None:
+    artifact = _genre_artifact()
+    with pytest.raises(AppError):
+        transform_artifact_sort(artifact, "column=Missing", 2)
+    with pytest.raises(AppError):
+        transform_artifact_sort(artifact, "column=TotalRevenue order=sideways", 2)
+
+
+def test_transform_select_keeps_requested_columns_in_order() -> None:
+    artifact = _genre_artifact()
+    result = transform_artifact_select(artifact, "columns=GenreName,TotalRevenue", 2).artifact
+    assert result.columns == ("GenreName", "TotalRevenue")
+    assert result.rows[0] == ("Rock", 826.65)
+    with pytest.raises(AppError):
+        transform_artifact_select(artifact, "columns=GenreName,Missing", 2)
+
+
+def test_transform_filter_gt_and_contains() -> None:
+    artifact = _genre_artifact()
+    gt = transform_artifact_filter(artifact, "column=TotalRevenue op=gt value=100", 2).artifact
+    assert [row[0] for row in gt.rows] == ["Rock", "Latin"]
+    contains = transform_artifact_filter(
+        artifact, "column=GenreName op=contains value=rock", 2
+    ).artifact
+    assert [row[0] for row in contains.rows] == ["Rock"]
+
+
+def test_transform_filter_rejects_bad_op_missing_and_empty_value() -> None:
+    artifact = _genre_artifact()
+    with pytest.raises(AppError):
+        transform_artifact_filter(artifact, "column=TotalRevenue op=between value=1", 2)
+    with pytest.raises(AppError):
+        transform_artifact_filter(artifact, "column=TotalRevenue op=gt", 2)
+    with pytest.raises(AppError):
+        transform_artifact_filter(artifact, "column=GenreName op=contains value=", 2)
+
+
+def test_transform_groupby_sum_mean_and_count() -> None:
+    artifact = _country_artifact()
+    summed = transform_artifact_groupby(artifact, "by=Country metric=Revenue agg=sum", 2).artifact
+    assert summed.columns == ("Country", "sum_Revenue")
+    assert dict(summed.rows) == {"India": 7, "USA": 25}
+    meaned = transform_artifact_groupby(artifact, "by=Country metric=Revenue agg=mean", 2).artifact
+    assert dict(meaned.rows) == {"India": 7.0, "USA": 12.5}
+    counted = transform_artifact_groupby(artifact, "by=Country agg=count", 2).artifact
+    assert counted.columns == ("Country", "count")
+    assert dict(counted.rows) == {"India": 2, "USA": 2}
+    non_null = transform_artifact_groupby(
+        artifact, "by=Country metric=Revenue agg=count", 2
+    ).artifact
+    assert dict(non_null.rows) == {"India": 1, "USA": 2}
+
+
+def test_transform_groupby_empty_numeric_group_is_none() -> None:
+    artifact = _make_artifact(
+        (("India", None),), sql="SELECT Country, Revenue FROM t", columns=("Country", "Revenue")
+    )
+    result = transform_artifact_groupby(artifact, "by=Country metric=Revenue agg=sum", 2).artifact
+    assert result.rows == (("India", None),)
+
+
+def test_transform_groupby_rejects_bad_agg_and_missing_metric() -> None:
+    artifact = _country_artifact()
+    with pytest.raises(AppError):
+        transform_artifact_groupby(artifact, "by=Country metric=Revenue agg=median", 2)
+    with pytest.raises(AppError):
+        transform_artifact_groupby(artifact, "by=Country agg=sum", 2)
+
+
+def test_transform_artifact_dispatch_and_unknown_op() -> None:
+    artifact = _genre_artifact()
+    result = transform_artifact(artifact, "sort", "column=TotalRevenue order=desc", 2)
+    assert isinstance(result, ArtifactTransformResult)
+    assert result.artifact.rows[0][0] == "Rock"
+    with pytest.raises(AppError):
+        transform_artifact(artifact, "pivot", "column=TotalRevenue", 2)
+
+
+def test_transform_metadata_and_truncated_semantics() -> None:
+    artifact = _genre_artifact(truncated=True)
+    # sort/select preserve truncated
+    sorted_result = transform_artifact_sort(artifact, "column=TotalRevenue", 7).artifact
+    assert sorted_result.artifact_id == 7
+    assert sorted_result.analysis_text is None
+    assert sorted_result.sql == artifact.sql
+    assert sorted_result.created_at
+    assert sorted_result.truncated is True
+    selected = transform_artifact_select(artifact, "columns=GenreName", 3).artifact
+    assert selected.truncated is True
+    # filter/groupby set truncated False but record the truncated source in the question
+    filtered = transform_artifact_filter(artifact, "column=TotalRevenue op=gt value=0", 4).artifact
+    assert filtered.truncated is False
+    assert "truncated artifact" in filtered.question
+    grouped = transform_artifact_groupby(artifact, "by=GenreName agg=count", 5).artifact
+    assert grouped.truncated is False
+    assert "truncated artifact" in grouped.question
+
+
+# --- v3.7: report export tests --------------------------------------------------------
+
+def test_markdown_report_rendering() -> None:
+    # empty artifacts raises AppError
+    with pytest.raises(AppError, match="No artifacts to report."):
+        core.render_artifact_report_markdown([])
+
+    artifact = _make_artifact(
+        rows=((1, "Alice|Bob", None), (2, b"binary_data", "active")),
+        columns=("id", "name", "status"),
+        question="Who is Alice?",
+        sql="SELECT * FROM users",
+        analysis_text="Some profile description here.",
+    )
+
+    report = core.render_artifact_report_markdown([artifact], title="Custom Report Title")
+
+    # report includes title
+    assert "# Custom Report Title" in report
+    # report includes question
+    assert "Who is Alice?" in report
+    # report includes SQL fenced block
+    assert "### SQL" in report
+    assert "```sql\nSELECT * FROM users\n```" in report
+    # report includes columns
+    assert "id, name, status" in report
+    # report includes preview rows and pipes in cell values are escaped, None is empty, bytes is <binary>
+    assert "id | name | status" in report
+    assert "1 | Alice\\|Bob | " in report
+    assert "2 | <binary> | active" in report
+    # analysis text appears when present
+    assert "### Analysis" in report
+    assert "Some profile description here." in report
+    # stored rows warning is present
+    assert "Report uses stored artifact rows only. No SQL was re-run." in report
+
+def test_markdown_report_rendering_backticks_fence() -> None:
+    # SQL containing triple backticks
+    artifact = _make_artifact(
+        rows=((1,),),
+        columns=("col",),
+        question="Q?",
+        sql="SELECT '```' AS val",
+        analysis_text="Profile containing ``` and ````",
+    )
+    report = core.render_artifact_report_markdown([artifact])
+    assert "````sql\nSELECT '```' AS val\n````" in report
+    assert "`````\nProfile containing ``` and ````\n`````" in report
+
+def test_markdown_report_preview_cap_note() -> None:
+    # Preview row cap note appears when rows exceed cap
+    artifact = _make_artifact(
+        rows=tuple((i,) for i in range(15)),
+        columns=("col",),
+    )
+    report = core.render_artifact_report_markdown([artifact], max_preview_rows=10)
+    assert "Showing first 10 of 15 stored rows." in report
+
+def test_html_report_rendering() -> None:
+    # empty artifacts raises AppError
+    with pytest.raises(AppError, match="No artifacts to report."):
+        core.render_artifact_report_html([])
+
+    artifact = _make_artifact(
+        rows=((1, "Alice & Bob <script>", None),),
+        columns=("id", "name <script>"),
+        question="Is <this> a test?",
+        sql="SELECT 1",
+        analysis_text="Test profile <info>",
+    )
+
+    report = core.render_artifact_report_html([artifact], title="HTML <title>")
+    
+    # HTML includes escaped question and values
+    assert "Is &lt;this&gt; a test?" in report
+    assert "id" in report
+    assert "name &lt;script&gt;" in report
+    assert "Alice &amp; Bob &lt;script&gt;" in report
+    # HTML includes escaped title
+    assert "HTML &lt;title&gt;" in report
+    # SQL appears inside <pre><code>
+    assert "<pre><code>SELECT 1</code></pre>" in report
+    # analysis text appears when present
+    assert "<h3>Analysis</h3>" in report
+    assert "<pre><code>Test profile &lt;info&gt;</code></pre>" in report
+    # stored rows warning is present
+    assert "Report uses stored artifact rows only. No SQL was re-run." in report
+
+def test_html_report_preview_cap_note() -> None:
+    # preview row cap note appears
+    artifact = _make_artifact(
+        rows=tuple((i,) for i in range(60)),
+        columns=("col",),
+    )
+    report = core.render_artifact_report_html([artifact], max_preview_rows=50)
+    assert "Showing first 50 of 60 stored rows." in report
+
+def test_export_artifact_report_behavior(tmp_path: Path) -> None:
+    settings = SimpleNamespace(output_path=tmp_path)
+    
+    art1 = _make_artifact(
+        rows=((1,),),
+        columns=("col",),
+        question="Q1",
+        artifact_id=1,
+    )
+    art2 = _make_artifact(
+        rows=((2,),),
+        columns=("col",),
+        question="Q2",
+        artifact_id=2,
+    )
+    artifacts = [art1, art2]
+
+    # report_format="md" writes .md
+    res1 = core.export_artifact_report(settings, artifacts, report_format="md")
+    assert res1.path.suffix == ".md"
+    assert res1.artifact_count == 1
+    assert res1.format == "markdown"
+    assert res1.path.read_text(encoding="utf-8").count("## Artifact #") == 1
+
+    # report_format="markdown" writes .md
+    res2 = core.export_artifact_report(settings, artifacts, report_format="markdown")
+    assert res2.path.suffix == ".md"
+    assert res2.format == "markdown"
+
+    # report_format="html" writes .html
+    res3 = core.export_artifact_report(settings, artifacts, report_format="html")
+    assert res3.path.suffix == ".html"
+    assert res3.format == "html"
+    assert res3.path.read_text(encoding="utf-8").count("<section>") == 1
+
+    # unsupported format raises AppError
+    with pytest.raises(AppError, match="Unsupported report format"):
+        core.export_artifact_report(settings, artifacts, report_format="pdf")
+
+    # include_all=True exports all artifacts
+    res_all = core.export_artifact_report(settings, artifacts, report_format="md", include_all=True)
+    assert res_all.artifact_count == 2
+    assert res_all.path.read_text(encoding="utf-8").count("## Artifact #") == 2
+
+    # two exports create distinct file paths
+    res_a = core.export_artifact_report(settings, artifacts, report_format="md")
+    res_b = core.export_artifact_report(settings, artifacts, report_format="md")
+    assert res_a.path != res_b.path
+
+
+def test_export_workspace_report(tmp_path: Path) -> None:
+    settings = SimpleNamespace(output_path=tmp_path)
+
+    art1 = _make_artifact(
+        rows=((1,),),
+        columns=("col1",),
+        question="Q1",
+        artifact_id=1,
+    )
+    art2 = _make_artifact(
+        rows=((2,),),
+        columns=("col2",),
+        question="Q2",
+        artifact_id=2,
+    )
+    artifacts = [art1, art2]
+
+    # Save to a workspace first
+    saved = save_artifact_workspace(settings, artifacts, name="test_ws")
+
+    # Export workspace report as Markdown
+    res = core.export_workspace_report(settings, "test_ws", report_format="md")
+    assert res.path.suffix == ".md"
+    assert res.artifact_count == 2
+    assert res.format == "markdown"
+
+    report_content = res.path.read_text(encoding="utf-8")
+    assert "## Artifact #1" in report_content
+    assert "## Artifact #2" in report_content
+    assert "Q1" in report_content
+    assert "Q2" in report_content
+
+    # Unknown workspace raises AppError
+    with pytest.raises(AppError, match="No workspace found"):
+        core.export_workspace_report(settings, "nonexistent", report_format="md")
+
+
+def test_export_workspace_report_ambiguous_prefix(tmp_path: Path) -> None:
+    settings = SimpleNamespace(output_path=tmp_path)
+    art = _make_artifact(rows=((1,),), columns=("col",))
+
+    # Save two workspaces with same name stem
+    save_artifact_workspace(settings, [art], name="genre_revenue_a")
+    save_artifact_workspace(settings, [art], name="genre_revenue_b")
+
+    # Call export_workspace_report with prefix -> raises AppError("Multiple workspaces match ...")
+    with pytest.raises(AppError, match="Multiple workspaces match"):
+        core.export_workspace_report(settings, "genre_revenue", report_format="md")
+
+

@@ -1085,7 +1085,7 @@ wheels = [
 
 [[package]]
 name = "sql-data-analyst-agent"
-version = "0.3.3"
+version = "0.3.8"
 source = { virtual = "." }
 dependencies = [
     { name = "openai" },

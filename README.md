@@ -94,6 +94,7 @@ generated code):
 | `:head [N]` | Show the first N rows (default 10) |
 | `:tail [N]` | Show the last N rows (default 10) |
 | `:export [csv]` | Export the result to `OUTPUT_DIR` as CSV |
+| `:report <md\|html> [all]` | Export result(s) to `OUTPUT_DIR/reports/` as Markdown/HTML |
 | `:plot bar x=<column> y=<column>` | Save a bar chart PNG to `OUTPUT_DIR/charts/` |
 | `:plot line x=<column> y=<column>` | Save a line chart PNG |
 | `:plot scatter x=<column> y=<column>` | Save a scatter chart PNG |
@@ -146,12 +147,109 @@ the matching artifact command (the session prints `Routed to :<command>`):
 - `plot bar x=GenreName y=TotalRevenue` → `:plot bar x=GenreName y=TotalRevenue`
 - `histogram of TotalRevenue` → `:plot hist column=TotalRevenue`
 
+Transformation follow-ups route to the v3.4 commands (each creates a new latest artifact):
+
+- `sort by TotalRevenue descending` → `:sort column=TotalRevenue order=desc`
+- `filter TotalRevenue greater than 100` → `:filter column=TotalRevenue op=gt value=100`
+- `where GenreName contains Rock` → `:filter column=GenreName op=contains value=Rock`
+- `select GenreName, TotalRevenue` → `:select columns=GenreName,TotalRevenue`
+- `group by Country sum Revenue` → `:groupby by=Country metric=Revenue agg=sum`
+- `count by Country` → `:groupby by=Country agg=count`
+
 This is a **deterministic router** to the existing artifact commands: it does **not** call the
-model, and it does **not** generate or execute any code. Chart column names are matched
-case-insensitively against the current result's columns. **Ambiguous or unrecognized requests
+model, and it does **not** generate or execute any code. Column names are matched
+case-insensitively against the **latest in-session artifact's** columns — not the original
+database schema — so after `select GenreName, TotalRevenue` a later `sort by TrackCount` no
+longer resolves (that column was dropped). There is **no fuzzy matching**: values containing
+spaces are not routed yet (use single-token values), and **ambiguous or unrecognized requests
 are treated as new database questions** rather than guessed — so an ordinary question like
 `top 5 genres by revenue` still runs the Text-to-SQL pipeline. The router is interactive-only;
 one-shot `ask "<question>"` never routes.
+
+##### Transformations
+
+These commands reshape the latest artifact and create a **new in-session artifact** that
+becomes the latest, so `:describe`, `:plot`, `:export csv`, `:head`, and `:tail` then operate on
+the transformed result:
+
+| Command | Action |
+| --- | --- |
+| `:sort column=<col> order=<asc\|desc>` | New artifact sorted by a column (default `asc`; missing values last) |
+| `:select columns=<col1,col2,...>` | New artifact with only those columns, in that order |
+| `:filter column=<col> op=<eq\|ne\|gt\|gte\|lt\|lte\|contains> value=<v>` | New artifact keeping matching rows |
+| `:groupby by=<col> metric=<col> agg=<sum\|mean\|count\|min\|max>` | New aggregated artifact (`metric` optional for `count`) |
+
+Transformations are **deterministic**: they do **not** call the model, do **not** run SQL, and
+do **not** execute any generated code — they operate only on the stored artifact snapshot. New
+artifacts are in-memory only (not written to disk). If the source artifact was truncated at
+`MAX_RESULT_ROWS`, the transform runs over that stored subset and the new artifact's question
+records a `[... applied to truncated artifact]` note.
+
+Transformation arguments are whitespace-separated `key=value` tokens. Values containing spaces
+are not supported yet (use exact single-token values), and `:select` columns must be
+comma-separated with no spaces, e.g. `columns=GenreName,TotalRevenue`.
+
+Example flow — filter, sort, then chart and export the reshaped result:
+
+```text
+Which genres generated the most revenue?
+:filter column=TotalRevenue op=gt value=100
+:sort column=TotalRevenue order=desc
+:plot bar x=GenreName y=TotalRevenue
+:export csv
+```
+
+##### Persistent workspaces
+
+Session artifacts are normally in-memory only. You can explicitly persist them to disk and
+reload them in a later session:
+
+| Command | Action |
+| --- | --- |
+| `:save` | Save the session's artifacts to a timestamped workspace |
+| `:save name=my_analysis` | Save under a named workspace (`my_analysis_<timestamp>/`) |
+| `:saved` | List saved workspaces |
+| `:load <workspace>` | Load a saved workspace (exact directory name **or** a unique prefix) |
+
+`:load my_analysis` resolves by unique prefix to `my_analysis_<timestamp>/`; if a prefix matches
+more than one workspace, the candidates are listed instead of guessing. Notes:
+
+- Workspaces are saved under `OUTPUT_DIR/workspaces/` (each holds `manifest.json` plus per-artifact
+  CSV, SQL, and optional profile text). **Saving is explicit — there is no autosave.**
+- **No model call and no SQL execution** happen during save or load.
+- **Loaded CSV values are strings**, because CSV does not preserve original Python/SQLite types.
+  Deterministic commands still work on a loaded workspace (e.g. `:filter ... op=gt value=100` and
+  `:plot` parse numeric strings), but exact dtypes from the original query are not restored.
+- For safety, `:load` only accepts a bare workspace name under `OUTPUT_DIR/workspaces/` —
+  absolute paths and `..` traversal are rejected.
+
+##### Report export
+
+You can export a report of the latest result artifact or all session artifacts in Markdown or HTML:
+
+| Command | Action |
+| --- | --- |
+| `:report md` | Export the latest result artifact as a Markdown report |
+| `:report html` | Export the latest result artifact as an HTML report |
+| `:report md all` | Export all session artifacts in order as a Markdown report |
+| `:report html all` | Export all session artifacts in order as an HTML report |
+| `:report md workspace=<workspace>` | Export all artifacts in a saved workspace as a Markdown report |
+| `:report html workspace=<workspace>` | Export all artifacts in a saved workspace as an HTML report |
+
+Aliases:
+- `:report markdown` is an alias for `:report md`
+- `:report markdown all` is an alias for `:report md all`
+- `:report markdown workspace=<workspace>` is an alias for `:report md workspace=<workspace>`
+
+Notes:
+- Reports are saved under `OUTPUT_DIR/reports/` as `report_<YYYYmmdd_HHMMSS>.<md|html>`. If a file exists, a numeric suffix like `_2`, `_3`, etc. is appended automatically to prevent overwrites.
+- Reports use **stored artifact rows only**.
+- **No SQL is re-run** and **no model call is made** during export.
+- Preview rows are capped at 50 rows.
+- Markdown reports are best for editing and sharing; HTML reports are standalone and viewable in any web browser.
+- Reports include a warning notice: `Report uses stored artifact rows only. No SQL was re-run.`
+- The `workspace=<workspace>` option accepts the same exact name or unique prefix as `:load`. Reports generated from workspaces include all artifacts stored within that workspace, do not alter the current in-session artifacts, and run completely offline without model calls or database access.
+
 
 Ask one question and exit:
 
