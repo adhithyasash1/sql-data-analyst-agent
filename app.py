@@ -27,6 +27,8 @@ from core import (
     export_artifact_report,
     export_workspace_report,
     index_schema,
+    inspect_workspace,
+    delete_workspace,
     list_saved_workspaces,
     load_artifact_workspace,
     make_result_artifact,
@@ -49,19 +51,21 @@ ARTIFACT_HELP = """Artifact commands (operate on the last result):
   :describe      Show a deterministic profile of the last result
   :head [N]      Show the first N rows (default 10)
   :tail [N]      Show the last N rows (default 10)
-  :export [csv]  Export the result to OUTPUT_DIR as CSV
-  :report <md|html> [all|workspace=<target>]   Export artifact report
+  :export csv    Export the result to OUTPUT_DIR as CSV
   :plot ...      Save a chart to OUTPUT_DIR/charts (bar/line/scatter x=.. y=.. | hist column=..)
-  :sort ...      New artifact sorted by a column (column=<c> order=<asc|desc>)
-  :select ...    New artifact with a subset of columns (columns=<c1,c2,...>)
-  :filter ...    New filtered artifact (column=<c> op=<eq|ne|gt|gte|lt|lte|contains> value=<v>)
-  :groupby ...   New aggregated artifact (by=<c> metric=<c> agg=<sum|mean|count|min|max>)
-  :save [name=<name>]  Save this session's artifacts to OUTPUT_DIR/workspaces
+  :sort ...      New sorted artifact (column=<col> order=<asc|desc>)
+  :select ...    New artifact with subset of columns (columns=<col1,col2,...>)
+  :filter ...    New filtered artifact (column=<col> op=<op> value=<val>)
+  :groupby ...   New aggregated artifact (by=<col> metric=<col> agg=<agg>)
+  :save [name=<name>]  Save session's artifacts to OUTPUT_DIR/workspaces
   :saved         List saved workspaces
-  :load <workspace>    Load a saved workspace (exact name or unique prefix)
+  :workspace-info <workspace>    Show saved workspace details
+  :delete-workspace <workspace>  Delete a saved workspace
+  :load <workspace>              Load a saved workspace
+  :report <md|html> [all|workspace=<workspace>]  Export artifact report
   :artifacts     List this session's results
   :help          Show this help
-  :q             Quit"""
+  :q / quit / exit  Quit the assistant"""
 
 
 def load_settings(db: Path | None = None, metadata_db: Path | None = None) -> Settings:
@@ -302,7 +306,41 @@ def handle_artifact_command(
             table.add_row(path.name, str(path))
         console.print(table)
         return
+    if name == "workspace-info":
+        target = arg.strip()
+        if not target:
+            console.print(Panel("Usage: :workspace-info <workspace>", title="Workspace Info", border_style="yellow"))
+            return
+        try:
+            info = inspect_workspace(settings, target)
+        except AppError as exc:
+            console.print(Panel(str(exc), title="Inspection failed", border_style="yellow"))
+            return
+        table = Table(title=f"Workspace: {info.name}")
+        table.add_column("Field", style="bold cyan")
+        table.add_column("Value")
+        table.add_row("Workspace", info.name)
+        table.add_row("Path", str(info.path))
+        table.add_row("Created", info.created_at or "n/a")
+        table.add_row("Artifacts", str(info.artifact_count))
+        table.add_row("Rows", str(info.row_count))
+        table.add_row("Files", ", ".join(info.files))
+        console.print(table)
+        return
+    if name == "delete-workspace":
+        target = arg.strip()
+        if not target:
+            console.print(Panel("Usage: :delete-workspace <workspace>", title="Delete Workspace", border_style="yellow"))
+            return
+        try:
+            res = delete_workspace(settings, target)
+            console.print(f"Deleted workspace {res.name} at {res.path}")
+        except AppError as exc:
+            console.print(Panel(str(exc), title="Delete failed", border_style="yellow"))
+            return
+        return
     if name == "load":
+
         target = arg.strip()
         if not target:
             console.print(Panel("Usage: :load <workspace>", title="Load", border_style="yellow"))
@@ -321,9 +359,9 @@ def handle_artifact_command(
         try:
             tokens = arg.split()
             if not tokens:
-                raise AppError("Missing report format. Use :report <md|html> [all] [workspace=<workspace>]")
+                raise AppError("Usage: :report <md|html> [all|workspace=<workspace>]")
             if len(tokens) > 2:
-                raise AppError("Too many arguments for report. Use :report <md|html> [all] [workspace=<workspace>]")
+                raise AppError("Usage: :report <md|html> [all|workspace=<workspace>]")
 
             format_str = tokens[0]
             fmt_lower = format_str.strip().lower()
@@ -344,7 +382,8 @@ def handle_artifact_command(
                         raise AppError("Empty workspace target. Use workspace=<workspace-name-or-prefix>")
                     workspace_target = target
                 else:
-                    raise AppError(f"Unknown option for report: {opt}")
+                    raise AppError(f"Unknown option(s) for report: {opt}")
+
 
             if workspace_target is not None:
                 result = export_workspace_report(

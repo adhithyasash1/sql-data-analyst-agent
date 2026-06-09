@@ -55,6 +55,8 @@ from core import (
     resolve_column,
     route_artifact_followup,
     list_saved_workspaces,
+    inspect_workspace,
+    delete_workspace,
     load_artifact_workspace,
     sanitize_workspace_name,
     save_artifact_workspace,
@@ -1231,9 +1233,12 @@ def test_parse_colon_command_variants() -> None:
     assert parse_colon_command(":export csv") == ("export", "csv")
     assert parse_colon_command(":describe") == ("describe", "")
     assert parse_colon_command(":head    5") == ("head", "5")  # collapses extra spaces
+    assert parse_colon_command(":workspace-info genre") == ("workspace-info", "genre")
+    assert parse_colon_command(":delete-workspace genre") == ("delete-workspace", "genre")
     assert parse_colon_command("list customers") is None
     assert parse_colon_command(":") is None
     assert parse_colon_command("   ") is None
+
 
 
 def test_parse_count_rules() -> None:
@@ -2130,5 +2135,151 @@ def test_export_workspace_report_ambiguous_prefix(tmp_path: Path) -> None:
     # Call export_workspace_report with prefix -> raises AppError("Multiple workspaces match ...")
     with pytest.raises(AppError, match="Multiple workspaces match"):
         core.export_workspace_report(settings, "genre_revenue", report_format="md")
+
+
+def test_inspect_workspace(tmp_path: Path) -> None:
+    settings = SimpleNamespace(output_path=tmp_path)
+    art1 = _make_artifact(
+        rows=((1,), (2,)),
+        columns=("col1",),
+        question="Q1",
+        artifact_id=1,
+    )
+    art2 = _make_artifact(
+        rows=((3,), (4,), (5,)),
+        columns=("col2",),
+        question="Q2",
+        artifact_id=2,
+    )
+    
+    # Save a workspace
+    saved = save_artifact_workspace(settings, [art1, art2], name="test_inspect")
+    
+    # inspect it
+    info = inspect_workspace(settings, "test_inspect")
+    assert info.name.startswith("test_inspect_")
+    assert info.path == saved.path
+    assert info.artifact_count == 2
+    assert info.row_count == 5
+    assert info.created_at is not None
+    assert "manifest.json" in info.files
+    assert "artifact_001.csv" in info.files
+    assert "artifact_001.sql" in info.files
+    assert "artifact_002.csv" in info.files
+    assert "artifact_002.sql" in info.files
+    
+    # works with unique prefix
+    prefix_info = inspect_workspace(settings, "test_ins")
+    assert prefix_info.name == info.name
+
+    # unknown target raises AppError
+    with pytest.raises(AppError, match="No workspace found"):
+        inspect_workspace(settings, "nonexistent")
+
+    # Save another one to make prefix ambiguous
+    save_artifact_workspace(settings, [art1], name="test_inspect_other")
+    with pytest.raises(AppError, match="Multiple workspaces match"):
+        inspect_workspace(settings, "test_ins")
+
+
+def test_delete_workspace(tmp_path: Path) -> None:
+    settings = SimpleNamespace(output_path=tmp_path)
+    art = _make_artifact(rows=((1,),), columns=("col",))
+    
+    # Save two workspaces
+    saved1 = save_artifact_workspace(settings, [art], name="genre_revenue_a")
+    saved2 = save_artifact_workspace(settings, [art], name="genre_revenue_b")
+    
+    # delete_workspace works with unique prefix
+    res = delete_workspace(settings, "genre_revenue_a")
+    assert res.path == saved1.path
+    assert res.name == saved1.path.name
+    
+    assert not saved1.path.exists()
+    assert saved2.path.exists()  # sibling workspace remains untouched
+    
+    # delete_workspace unknown target raises AppError
+    with pytest.raises(AppError, match="No workspace found"):
+        delete_workspace(settings, "nonexistent")
+        
+    # delete_workspace ambiguous prefix raises AppError
+    save_artifact_workspace(settings, [art], name="genre_revenue_a_new")
+    # now we have genre_revenue_a_new and genre_revenue_b, wait, a unique prefix for "genre_revenue" is ambiguous
+    with pytest.raises(AppError, match="Multiple workspaces match"):
+        delete_workspace(settings, "genre_revenue")
+
+    # delete_workspace("../outside") raises AppError
+    with pytest.raises(AppError, match="Workspace must be a bare name"):
+        delete_workspace(settings, "../outside")
+        
+    # delete_workspace(str(tmp_path)) absolute path raises AppError
+    with pytest.raises(AppError, match="Workspace must be a name under the workspaces directory, not an absolute path"):
+        delete_workspace(settings, str(tmp_path))
+
+
+def test_inspect_workspace_malformed_manifest(tmp_path: Path) -> None:
+    settings = SimpleNamespace(output_path=tmp_path)
+    art = _make_artifact(rows=((1,),), columns=("col",))
+    saved = save_artifact_workspace(settings, [art], name="malformed_test")
+    
+    # Write invalid JSON to manifest.json
+    (saved.path / "manifest.json").write_text("invalid json {", encoding="utf-8")
+    
+    with pytest.raises(AppError, match="Could not read workspace manifest"):
+        inspect_workspace(settings, "malformed_test")
+
+
+def test_inspect_workspace_missing_artifacts_list(tmp_path: Path) -> None:
+    settings = SimpleNamespace(output_path=tmp_path)
+    art = _make_artifact(rows=((1,),), columns=("col",))
+    saved = save_artifact_workspace(settings, [art], name="bad_artifacts_test")
+    
+    # Write dict with artifacts not being list
+    (saved.path / "manifest.json").write_text('{"artifacts": "not a list"}', encoding="utf-8")
+    
+    with pytest.raises(AppError, match="Invalid workspace manifest: artifacts must be a list"):
+        inspect_workspace(settings, "bad_artifacts_test")
+
+
+def test_resolve_workspace_target_validation(tmp_path: Path) -> None:
+    workspaces_dir = tmp_path / "workspaces"
+    workspaces_dir.mkdir()
+    
+    # Empty target
+    with pytest.raises(AppError, match="Usage: :load <workspace>."):
+        core.resolve_workspace_target(workspaces_dir, "")
+        
+    # Absolute path
+    with pytest.raises(AppError, match="Workspace must be a name under the workspaces directory, not an absolute path"):
+        core.resolve_workspace_target(workspaces_dir, "/absolute/path")
+        
+    # Path separators or traversal
+    with pytest.raises(AppError, match="Workspace must be a bare name"):
+        core.resolve_workspace_target(workspaces_dir, "../traversal")
+    with pytest.raises(AppError, match="Workspace must be a bare name"):
+        core.resolve_workspace_target(workspaces_dir, "sub/folder")
+    with pytest.raises(AppError, match="Workspace must be a bare name"):
+        core.resolve_workspace_target(workspaces_dir, "sub\\folder")
+        
+    # No workspaces exist at all
+    with pytest.raises(AppError, match="No workspace found"):
+        core.resolve_workspace_target(workspaces_dir, "missing")
+        
+    # Create two workspaces
+    ws1 = workspaces_dir / "genre_revenue_a"
+    ws1.mkdir()
+    (ws1 / "manifest.json").write_text("{}", encoding="utf-8")
+    ws2 = workspaces_dir / "genre_revenue_b"
+    ws2.mkdir()
+    (ws2 / "manifest.json").write_text("{}", encoding="utf-8")
+    
+    # Ambiguous prefix
+    with pytest.raises(AppError, match="Multiple workspaces match"):
+        core.resolve_workspace_target(workspaces_dir, "genre_revenue")
+        
+    # Exact match works
+    assert core.resolve_workspace_target(workspaces_dir, "genre_revenue_a") == ws1
+
+
 
 

@@ -80,28 +80,38 @@ Start the interactive assistant:
 uv run python app.py ask --db data/your.db
 ```
 
-#### Interactive commands
+#### Command Reference
 
-Inside the interactive assistant, the last successful result is kept as an in-session
-**artifact** you can inspect and export with deterministic colon-commands (no model call, no
-generated code):
+The assistant supports top-level command-line entry points and interactive in-session colon commands:
 
-| Command | Action |
-| --- | --- |
-| `:sql` | Show the SQL for the last result |
-| `:columns` | Show the result column names |
-| `:describe` | Show a deterministic profile (shape, dtypes, null/distinct, numeric min/max/mean) |
-| `:head [N]` | Show the first N rows (default 10) |
-| `:tail [N]` | Show the last N rows (default 10) |
-| `:export [csv]` | Export the result to `OUTPUT_DIR` as CSV |
-| `:report <md\|html> [all]` | Export result(s) to `OUTPUT_DIR/reports/` as Markdown/HTML |
-| `:plot bar x=<column> y=<column>` | Save a bar chart PNG to `OUTPUT_DIR/charts/` |
-| `:plot line x=<column> y=<column>` | Save a line chart PNG |
-| `:plot scatter x=<column> y=<column>` | Save a scatter chart PNG |
-| `:plot hist column=<column>` | Save a histogram PNG |
-| `:artifacts` | List this session's results |
-| `:help` | Show this help |
-| `:q` / `exit` / `quit` | Quit |
+| Command | Purpose | Model? | SQL? | Scope |
+| --- | --- | --- | --- | --- |
+| `index` | Inspect database and build schema index | Yes | Yes (Read-only) | DB |
+| `ask "<question>"` | Ask a question once, or start interactive prompt | Yes | Yes (Read-only) | DB |
+| `download-northwind` | Download the demo Northwind SQLite database | No | No | DB |
+| `:help` | Show command helper text | No | No | Stored artifact |
+| `:q` / `quit` / `exit` | Quit the assistant | No | No | Stored artifact |
+| `:sql` | Show the SQL query for the last result | No | No | Stored artifact |
+| `:columns` | Show the column names of the last result | No | No | Stored artifact |
+| `:describe` | Show a deterministic profile of the last result | No | No | Stored artifact |
+| `:head [N]` | Show the first N rows of the last result | No | No | Stored artifact |
+| `:tail [N]` | Show the last N rows of the last result | No | No | Stored artifact |
+| `:export csv` | Export the last result as CSV | No | Yes (Read-only)* | Stored artifact |
+| `:plot ...` | Save a chart PNG to `OUTPUT_DIR/charts/` | No | No | Stored artifact |
+| `:sort ...` | Create new artifact sorted by a column | No | No | Stored artifact |
+| `:select ...` | Create new artifact with a subset of columns | No | No | Stored artifact |
+| `:filter ...` | Create new filtered artifact keeping matching rows | No | No | Stored artifact |
+| `:groupby ...` | Create new grouped/aggregated artifact | No | No | Stored artifact |
+| `:save [name=<name>]` | Save session's artifacts to `OUTPUT_DIR/workspaces/` | No | No | Workspace |
+| `:saved` | List saved workspaces | No | No | Workspace |
+| `:workspace-info <workspace>` | Show details of a saved workspace | No | No | Workspace |
+| `:delete-workspace <workspace>`| Delete a saved workspace directory | No | No | Workspace |
+| `:load <workspace>` | Load saved workspace artifacts | No | No | Workspace |
+| `:report <md\|html> [all]` | Export current session report | No | No | Report |
+| `:report <md\|html> workspace=<workspace>` | Export report from a saved workspace | No | No | Report |
+
+\* Note: `:export csv` performs a read-only fetch against the database *only if* the displayed rows were truncated.
+
 
 These work in interactive mode only. **Artifacts are in-memory and last only for the current
 session; only exported CSV files persist.** `:describe` recomputes from the stored rows when
@@ -209,6 +219,8 @@ reload them in a later session:
 | `:save` | Save the session's artifacts to a timestamped workspace |
 | `:save name=my_analysis` | Save under a named workspace (`my_analysis_<timestamp>/`) |
 | `:saved` | List saved workspaces |
+| `:workspace-info <workspace>` | Show saved workspace details (exact name or unique prefix) |
+| `:delete-workspace <workspace>` | Delete a saved workspace (exact name or unique prefix) |
 | `:load <workspace>` | Load a saved workspace (exact directory name **or** a unique prefix) |
 
 `:load my_analysis` resolves by unique prefix to `my_analysis_<timestamp>/`; if a prefix matches
@@ -216,12 +228,13 @@ more than one workspace, the candidates are listed instead of guessing. Notes:
 
 - Workspaces are saved under `OUTPUT_DIR/workspaces/` (each holds `manifest.json` plus per-artifact
   CSV, SQL, and optional profile text). **Saving is explicit — there is no autosave.**
-- **No model call and no SQL execution** happen during save or load.
+- **No model call and no SQL execution** happen during save, load, info inspection, or deletion.
 - **Loaded CSV values are strings**, because CSV does not preserve original Python/SQLite types.
   Deterministic commands still work on a loaded workspace (e.g. `:filter ... op=gt value=100` and
   `:plot` parse numeric strings), but exact dtypes from the original query are not restored.
-- For safety, `:load` only accepts a bare workspace name under `OUTPUT_DIR/workspaces/` —
-  absolute paths and `..` traversal are rejected.
+- For safety, `:load`, `:workspace-info`, and `:delete-workspace` only accept a bare workspace name under `OUTPUT_DIR/workspaces/` — absolute paths, path separators, and `..` traversal are rejected.
+- `:delete-workspace` recursively deletes the target workspace directory under `OUTPUT_DIR/workspaces/` only. It does not delete or touch reports, charts, CSV exports, metadata DBs, or source DBs, and sibling workspaces remain untouched. No confirmation prompt is shown.
+
 
 ##### Report export
 
@@ -247,11 +260,36 @@ Notes:
 - **No SQL is re-run** and **no model call is made** during export.
 - Preview rows are capped at 50 rows.
 - Markdown reports are best for editing and sharing; HTML reports are standalone and viewable in any web browser.
-- Reports include a warning notice: `Report uses stored artifact rows only. No SQL was re-run.`
-- The `workspace=<workspace>` option accepts the same exact name or unique prefix as `:load`. Reports generated from workspaces include all artifacts stored within that workspace, do not alter the current in-session artifacts, and run completely offline without model calls or database access.
+##### Example workflows
+
+Here are three common lifecycle patterns in the interactive CLI:
+
+1. **Transform and Chart**: Filter a database query, sort the remaining records, and plot a chart of the results:
+   ```text
+   Which genres generated the most revenue?
+   filter TotalRevenue greater than 100
+   sort by TotalRevenue descending
+   :plot bar x=GenreName y=TotalRevenue
+   ```
+
+2. **Save and Resume**: Save the current interactive session, list the saved workspaces, and load it back later:
+   ```text
+   :save name=genre_revenue
+   :saved
+   :load genre_revenue
+   :artifacts
+   ```
+
+3. **Report a Saved Workspace**: Generate HTML or Markdown reports from a saved workspace directory:
+   ```text
+   :report md workspace=genre_revenue
+   :report html workspace=genre_revenue
+   ```
+   *Note: Workspace arguments accept either exact folder names or any unique prefix. Ambiguous prefixes are rejected with a list of matches.*
 
 
 Ask one question and exit:
+
 
 ```bash
 # Demo database (default)
@@ -305,16 +343,17 @@ When `ENABLE_DATAFRAME_ANALYSIS=true`, a successful result is turned into a `pya
 
 Install the optional dependencies once with `uv sync --extra analysis` (pandas + pyarrow), then run normally (`ENABLE_DATAFRAME_ANALYSIS=true uv run python app.py ask ...`); `uv run --extra analysis python app.py ...` works as a one-shot alternative. The feature is off by default, and if it is enabled without the extra installed the answer still succeeds with a notice. **Note:** if displayed rows were truncated at `MAX_RESULT_ROWS`, analysis performs one additional bounded read-only fetch up to `MAX_ANALYSIS_ROWS`; if the result still exceeds that cap, the profile (and grounded summary) describe that capped subset and say so.
 
-## Safety Boundaries
+## Safety Guarantees
 
-- Only one parseable SQLite statement is allowed.
-- Only `SELECT` and non-recursive `WITH ... SELECT` are allowed.
-- Prohibited commands include `INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`, `CREATE`, `PRAGMA`, `ATTACH`, and `DETACH`.
-- SQL comments are rejected.
-- SQLite system tables are rejected.
-- Tables and views are allowed as read-only SELECT sources and validated strictly; column checks are pragmatic for aliases and CTEs.
-- Queries run through `sqlite3` with `mode=ro`, extension loading disabled, row limits, and a progress-handler timeout.
-- sqlite-vec is loaded only for the metadata database, never for the source database.
+The application enforces the following safety boundaries and guarantees:
+- **Read-Only SQLite Connection**: All database queries run through `sqlite3` in read-only mode (`mode=ro`), with extension loading disabled, row limits, and a progress-handler timeout.
+- **Write SQL Rejection**: SQL validation checks block prohibited statements (such as `INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`, `CREATE`, `PRAGMA`, `ATTACH`, `DETACH`) and reject comments or system tables.
+- **No Python/Generated Code Execution**: No model-generated code or dynamic Python blocks are ever executed by the assistant.
+- **Deterministic Artifact Scope**: Interactive artifact commands (like `:sort`, `:select`, `:filter`, `:groupby`, `:plot`) process already-validated in-memory rows only. They do not run SQL or call the model.
+- **Confined Workspace Operations**: Workspace reads, writes, and deletions are strictly confined to the `OUTPUT_DIR/workspaces` directory. The resolver rejects absolute paths, path separators, and parent directory traversal (`..`). Sibling workspace folders are left completely untouched.
+- **Offline Reports**: Exported reports use stored artifact rows only. No SQL query is re-run and no model calls are made during Markdown or HTML generation.
+- **Friendly Model/Connection Errors**: Local model server issues (such as connection failures or API errors) are captured and surfaced as readable `AppError` notices instead of causing system crashes.
+
 
 ## Example Questions
 

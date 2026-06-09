@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sqlite3
 import time
 import urllib.request
@@ -224,6 +225,22 @@ class WorkspaceSaveResult:
 class WorkspaceLoadResult:
     artifacts: tuple[ResultArtifact, ...]
     path: Path
+
+
+@dataclass(frozen=True)
+class WorkspaceInfo:
+    path: Path
+    name: str
+    artifact_count: int
+    row_count: int
+    created_at: str | None
+    files: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class WorkspaceDeleteResult:
+    path: Path
+    name: str
 
 
 @dataclass(frozen=True)
@@ -2159,7 +2176,62 @@ def load_artifact_workspace(settings: Settings, target: str) -> WorkspaceLoadRes
     return WorkspaceLoadResult(artifacts=tuple(artifacts), path=workspace_path)
 
 
+def inspect_workspace(settings, target: str) -> WorkspaceInfo:
+    try:
+        workspaces_dir = settings.output_path / "workspaces"
+        workspace_path = resolve_workspace_target(workspaces_dir, target)
+        
+        manifest_path = workspace_path / "manifest.json"
+        try:
+            manifest_content = manifest_path.read_text(encoding="utf-8")
+            manifest = json.loads(manifest_content)
+        except Exception as exc:
+            raise AppError(f"Could not read workspace manifest: {exc}") from exc
+        
+        artifacts = manifest.get("artifacts", [])
+        if not isinstance(artifacts, list):
+            raise AppError("Invalid workspace manifest: artifacts must be a list.")
+            
+        artifact_count = int(manifest.get("artifact_count") or len(artifacts))
+        row_count = sum(int(entry.get("row_count") or 0) for entry in artifacts)
+        created_at = manifest.get("created_at")
+        
+        files = tuple(sorted(p.name for p in workspace_path.iterdir() if p.is_file()))
+        
+        return WorkspaceInfo(
+            path=workspace_path,
+            name=workspace_path.name,
+            artifact_count=artifact_count,
+            row_count=row_count,
+            created_at=created_at,
+            files=files,
+        )
+    except AppError:
+        raise
+    except Exception as exc:
+        raise AppError(f"Error inspecting workspace: {exc}") from exc
+
+
+def delete_workspace(settings, target: str) -> WorkspaceDeleteResult:
+    try:
+        workspaces_dir = settings.output_path / "workspaces"
+        workspace_path = resolve_workspace_target(workspaces_dir, target)
+        
+        name = workspace_path.name
+        try:
+            shutil.rmtree(workspace_path)
+        except OSError as exc:
+            raise AppError(f"Could not delete workspace {name}: {exc}") from exc
+            
+        return WorkspaceDeleteResult(path=workspace_path, name=name)
+    except AppError:
+        raise
+    except Exception as exc:
+        raise AppError(f"Error deleting workspace: {exc}") from exc
+
+
 # --- v3.2: deterministic chart artifacts -----------------------------------------------
+
 
 _CHART_TYPES = ("bar", "line", "scatter", "hist")
 
