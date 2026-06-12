@@ -626,6 +626,20 @@ def test_shape_repair_prompt_keeps_dynamic_sections() -> None:
     assert prompt.rstrip().endswith("Corrected SQL:")
 
 
+def test_log_query_is_best_effort_when_metadata_db_unwritable(tmp_path: Path) -> None:
+    blocked = tmp_path / "metadata.db"
+    blocked.mkdir()  # a directory at the DB path makes sqlite unable to open it
+    settings = Settings(
+        omlx_api_key="test",
+        db_path=tmp_path / "northwind.db",
+        metadata_db_path=blocked,
+    )
+    result = AnswerResult(question="hi", retrieved_tables=["Customers"], expanded_tables=[])
+    result.success = True
+
+    log_query(settings, result)  # must not raise
+
+
 def test_read_query_logs_returns_dict_rows_with_expected_keys(tmp_path: Path) -> None:
     settings = Settings(
         omlx_api_key="test",

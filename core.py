@@ -11,7 +11,7 @@ import sqlite3
 import time
 import urllib.request
 from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -3334,43 +3334,47 @@ def summarize_result(
 def log_query(settings: Settings, result: AnswerResult) -> None:
     if not settings.enable_query_logging:
         return
-    with metadata_connection(settings.metadata_path) as conn:
-        setup_metadata(conn)
-        conn.execute(
-            """
-            INSERT INTO query_logs(
-                question, generated_sql, initial_sql, success, executed, cancelled,
-                error_message, validation_error, repair_reason, repaired,
-                retrieved_objects, summary, summary_mode, summary_error, shape_warning,
-                execution_ms, row_count, prompt_tokens, completion_tokens, total_tokens,
-                created_at
+    try:
+        with metadata_connection(settings.metadata_path) as conn:
+            setup_metadata(conn)
+            conn.execute(
+                """
+                INSERT INTO query_logs(
+                    question, generated_sql, initial_sql, success, executed, cancelled,
+                    error_message, validation_error, repair_reason, repaired,
+                    retrieved_objects, summary, summary_mode, summary_error, shape_warning,
+                    execution_ms, row_count, prompt_tokens, completion_tokens, total_tokens,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    result.question,
+                    result.sql,
+                    result.initial_sql,
+                    int(result.success),
+                    int(result.executed),
+                    int(result.cancelled),
+                    result.error_message,
+                    result.validation_error,
+                    result.repair_reason,
+                    int(result.repaired),
+                    json.dumps(result.retrieved_tables),
+                    result.summary,
+                    result.summary_mode,
+                    result.summary_error,
+                    result.shape_warning,
+                    result.execution_ms,
+                    len(result.rows),
+                    result.token_usage.prompt_tokens,
+                    result.token_usage.completion_tokens,
+                    result.token_usage.total_tokens,
+                    utc_now(),
+                ),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                result.question,
-                result.sql,
-                result.initial_sql,
-                int(result.success),
-                int(result.executed),
-                int(result.cancelled),
-                result.error_message,
-                result.validation_error,
-                result.repair_reason,
-                int(result.repaired),
-                json.dumps(result.retrieved_tables),
-                result.summary,
-                result.summary_mode,
-                result.summary_error,
-                result.shape_warning,
-                result.execution_ms,
-                len(result.rows),
-                result.token_usage.prompt_tokens,
-                result.token_usage.completion_tokens,
-                result.token_usage.total_tokens,
-                utc_now(),
-            ),
-        )
+    except (sqlite3.Error, OSError):
+        # Logging is best-effort: a failed metadata write must never break an answer.
+        return
 
 
 def add_usage(left: UsageStats, right: UsageStats) -> UsageStats:
@@ -3652,7 +3656,7 @@ def verify_sqlite_database(path: Path) -> int:
     if not path.exists():
         raise AppError(f"Database not found: {path}")
     try:
-        with sqlite3.connect(sqlite_readonly_uri(path), uri=True) as conn:
+        with closing(sqlite3.connect(sqlite_readonly_uri(path), uri=True)) as conn:
             objects = [
                 str(row[0])
                 for row in conn.execute(
@@ -3673,7 +3677,7 @@ def verify_sqlite_database(path: Path) -> int:
 def verify_northwind_database(path: Path) -> int:
     verify_sqlite_database(path)
     try:
-        with sqlite3.connect(sqlite_readonly_uri(path), uri=True) as conn:
+        with closing(sqlite3.connect(sqlite_readonly_uri(path), uri=True)) as conn:
             rows = conn.execute(
                 """
                 SELECT name

@@ -184,7 +184,13 @@ def ask(
     artifacts: list[ResultArtifact] = []
     analyses: list[AnalysisArtifact] = []
     while True:
-        user_input = Prompt.ask("[bold]You[/bold]").strip()
+        try:
+            user_input = Prompt.ask("[bold]You[/bold]").strip()
+        except EOFError:
+            break
+        except KeyboardInterrupt:
+            console.print("[dim]Interrupted. Use :q or Ctrl+D to exit.[/dim]")
+            continue
         if not user_input:
             continue
         if user_input.lower() in {"exit", "quit"}:
@@ -214,7 +220,11 @@ def ask(
                     verbose,
                 )
                 continue
-        result = run_question(settings, client, user_input, verbose)
+        try:
+            result = run_question(settings, client, user_input, verbose)
+        except KeyboardInterrupt:
+            console.print("[dim]Question cancelled.[/dim]")
+            continue
         if result.success and result.sql and result.columns:
             artifacts.append(make_result_artifact(len(artifacts) + 1, result))
 

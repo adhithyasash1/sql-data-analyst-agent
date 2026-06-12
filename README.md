@@ -122,6 +122,10 @@ Inside `ask`, each successful query stores an in-memory **result artifact**. Col
 on artifacts deterministically — they never call the model and never execute generated code.
 **Artifacts and analysis digests stay in memory until you explicitly export or `:save`.**
 
+The session is interrupt-safe: **Ctrl+C** at the prompt re-prompts, **Ctrl+C** during a running
+question cancels just that question, and **Ctrl+D** (or `:q`) exits — none of them crash the
+session or lose your in-memory artifacts.
+
 ### Inspect the latest result
 
 | Command | Action |
@@ -289,7 +293,7 @@ Settings load from `.env` (see `.env.example`). The most useful ones:
 | `REQUIRE_SQL_APPROVAL` | `false` | Ask before executing validated SQL |
 | `ENABLE_RESULT_SHAPE_CHECK` | `true` | Result-shape heuristics (disable if noisy on unusual schemas) |
 | `ENABLE_LLM_SUMMARY` | `false` | Optional second model call for a grounded narrative summary |
-| `ENABLE_QUERY_LOGGING` | `true` | Store local query logs in the metadata DB |
+| `ENABLE_QUERY_LOGGING` | `true` | Store local query logs in the metadata DB (best-effort: a failed log write never breaks an answer) |
 | `ENABLE_SCHEMA_PROFILING` | `true` | Add bounded row counts and sample values to schema docs |
 | `MAX_PROFILE_VALUES` | `3` | Sample values per column during profiling |
 | `MAX_PROFILE_TEXT_LENGTH` | `80` | Max characters per sampled text value |
@@ -323,7 +327,8 @@ multi-database backend.
   `OUTPUT_DIR/workspaces/`; absolute paths, separators, and `..` traversal are rejected.
 - **Offline reports** — exports use stored rows and saved digests only; no SQL re-runs, no model calls.
 - **Friendly failures** — model/connection problems surface as readable `AppError` notices, not
-  stack traces.
+  stack traces; keyboard interrupts cancel cleanly without losing the session; query logging is
+  best-effort and never fails an answer.
 
 ## Architecture
 
