@@ -186,6 +186,27 @@ class ResultArtifact:
 
 
 @dataclass(frozen=True)
+class AnalysisArtifactTable:
+    title: str
+    columns: tuple[str, ...]
+    rows: tuple[tuple[Any, ...], ...]
+
+
+@dataclass(frozen=True)
+class AnalysisArtifact:
+    analysis_id: int
+    source_artifact_id: int
+    recipe: str
+    status: str
+    title: str
+    summary: str
+    tables: tuple[AnalysisArtifactTable, ...]
+    metrics: dict[str, Any] = field(default_factory=dict)
+    warnings: tuple[str, ...] = ()
+    created_at: str = ""
+
+
+@dataclass(frozen=True)
 class ExportResult:
     path: Path
     row_count: int
@@ -219,12 +240,14 @@ class ArtifactTransformResult:
 class WorkspaceSaveResult:
     path: Path
     artifact_count: int
+    analysis_count: int = 0
 
 
 @dataclass(frozen=True)
 class WorkspaceLoadResult:
     artifacts: tuple[ResultArtifact, ...]
     path: Path
+    analyses: tuple[AnalysisArtifact, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -248,6 +271,7 @@ class ReportExportResult:
     path: Path
     artifact_count: int
     format: str
+    analysis_count: int = 0
 
 
 
@@ -1036,6 +1060,12 @@ def is_total_count_question(question: str) -> bool:
     return BREAKDOWN_RE.search(question.lower()) is None
 
 
+def text_has_intent_phrase(text: str, phrase: str) -> bool:
+    if " " in phrase:
+        return phrase in text
+    return re.search(rf"\b{re.escape(phrase)}\b", text) is not None
+
+
 def infer_shape_expectation(question: str) -> ShapeExpectation:
     text = question.lower()
     entity_specs = [
@@ -1059,6 +1089,12 @@ def infer_shape_expectation(question: str) -> ShapeExpectation:
         # so do not require an entity label for "how many / count / number of" questions.
         entity_terms = []
 
+    temporal_order_desc = any(
+        phrase in text for phrase in ("most recent", "latest", "newest", "recent")
+    )
+    temporal_order_asc = any(phrase in text for phrase in ("oldest", "earliest"))
+    temporal_order = temporal_order_desc or temporal_order_asc
+
     numeric_words = (
         "count",
         "how many",
@@ -1077,19 +1113,29 @@ def infer_shape_expectation(question: str) -> ShapeExpectation:
         "largest",
         "smallest",
     )
-    requires_numeric = any(word in text for word in numeric_words)
+    requires_numeric = (
+        any(text_has_intent_phrase(text, word) for word in numeric_words) and not temporal_order
+    )
     order_words = ("most", "least", "top", "highest", "lowest", "largest", "smallest")
-    requires_order = any(word in text for word in order_words)
+    ranked_order = (
+        any(text_has_intent_phrase(text, word) for word in order_words) and not temporal_order
+    )
+    requires_order = ranked_order or temporal_order
     order_direction = None
     if requires_order:
-        order_direction = "ASC" if any(word in text for word in ("least", "lowest", "smallest")) else "DESC"
+        order_direction = (
+            "ASC"
+            if temporal_order_asc
+            or any(text_has_intent_phrase(text, word) for word in ("least", "lowest", "smallest"))
+            else "DESC"
+        )
 
     aggregate_kind = None
-    if "average" in text or "avg" in text or "mean" in text:
+    if any(text_has_intent_phrase(text, word) for word in ("average", "avg", "mean")):
         aggregate_kind = "average"
-    elif "total" in text or "sum" in text:
+    elif any(text_has_intent_phrase(text, word) for word in ("total", "sum")):
         aggregate_kind = "total"
-    elif "count" in text or "how many" in text or "most" in text or "least" in text:
+    elif question_has_count_intent(question) or ranked_order:
         aggregate_kind = "count"
 
     expected_limit = None
@@ -1097,6 +1143,7 @@ def infer_shape_expectation(question: str) -> ShapeExpectation:
         r"\btop\s+(\d{1,3})\b",
         r"\bfirst\s+(\d{1,3})\b",
         r"\blimit\s+(\d{1,3})\b",
+        r"\b(?:list|show)\s+(?:the\s+)?(\d{1,3})\b",
     )
     for pattern in limit_patterns:
         match = re.search(pattern, text)
@@ -1606,14 +1653,17 @@ def deterministic_summary(
         return f"Returned {row_count} rows; more rows may exist."
 
     column_types = infer_column_types(columns, rows)
+    if expectation is None:
+        expectation = infer_shape_expectation(question)
+    if is_detail_listing_summary(question, expectation):
+        return f"Returned {row_count} row{'s' if row_count != 1 else ''}."
+
     numeric_indexes = [
         index
         for index, column in enumerate(columns)
         if column_types.get(column) == "numeric" and is_metric_column(column)
     ]
     if rows and len(columns) >= 2 and numeric_indexes:
-        if expectation is None:
-            expectation = infer_shape_expectation(question)
         metric_index = numeric_indexes[-1]
         direction = expectation.order_direction or "DESC"
         ranked_row = ranked_numeric_row(rows, metric_index, direction)
@@ -1627,6 +1677,16 @@ def deterministic_summary(
             f"with {format_value(ranked_row[metric_index])}."
         )
     return f"Returned {row_count} row{'s' if row_count != 1 else ''}."
+
+
+def is_detail_listing_summary(question: str, expectation: ShapeExpectation) -> bool:
+    text = question.lower()
+    starts_like_detail = text.startswith(("list", "show", "give me"))
+    temporal_order = any(
+        phrase in text
+        for phrase in ("most recent", "latest", "newest", "recent", "oldest", "earliest")
+    )
+    return (starts_like_detail or temporal_order) and not expectation.requires_numeric
 
 
 def is_metric_column(column: str) -> bool:
@@ -1816,7 +1876,7 @@ def profile_result_dataframe(
             )
         )
     return DataFrameProfile(
-        row_count=int(len(frame)),
+        row_count=len(frame),
         column_count=len(columns),
         columns=tuple(stats),
         profiled_truncated=profiled_truncated,
@@ -2002,6 +2062,145 @@ def _app_version() -> str:
         return "unknown"
 
 
+def _json_safe_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return "<binary>"
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item) for item in value]
+    return str(value)
+
+
+def _analysis_artifact_to_dict(analysis: AnalysisArtifact) -> dict[str, Any]:
+    metrics = _json_safe_value(analysis.metrics)
+    return {
+        "analysis_id": analysis.analysis_id,
+        "source_artifact_id": analysis.source_artifact_id,
+        "recipe": analysis.recipe,
+        "status": analysis.status,
+        "title": analysis.title,
+        "summary": analysis.summary,
+        "metrics": metrics if isinstance(metrics, dict) else {},
+        "warnings": list(analysis.warnings),
+        "created_at": analysis.created_at,
+        "tables": [
+            {
+                "title": table.title,
+                "columns": list(table.columns),
+                "rows": [
+                    [_json_safe_value(value) for value in row]
+                    for row in table.rows
+                ],
+            }
+            for table in analysis.tables
+        ],
+    }
+
+
+def _analysis_artifact_from_dict(data: dict[str, Any]) -> AnalysisArtifact:
+    tables_data = data.get("tables", [])
+    if not isinstance(tables_data, list):
+        raise AppError("Invalid analysis artifact: tables must be a list.")
+
+    tables: list[AnalysisArtifactTable] = []
+    for table_data in tables_data:
+        if not isinstance(table_data, dict):
+            raise AppError("Invalid analysis artifact: table entry must be an object.")
+        columns_data = table_data.get("columns", [])
+        rows_data = table_data.get("rows", [])
+        if not isinstance(columns_data, list) or not isinstance(rows_data, list):
+            raise AppError("Invalid analysis artifact: table columns and rows must be lists.")
+        rows = tuple(
+            tuple(row if isinstance(row, list) else [row])
+            for row in rows_data
+        )
+        tables.append(
+            AnalysisArtifactTable(
+                title=str(table_data.get("title", "Result Table")),
+                columns=tuple(str(column) for column in columns_data),
+                rows=rows,
+            )
+        )
+
+    metrics = data.get("metrics", {})
+    warnings = data.get("warnings", [])
+    return AnalysisArtifact(
+        analysis_id=int(data.get("analysis_id", 0) or 0),
+        source_artifact_id=int(data.get("source_artifact_id", 0) or 0),
+        recipe=str(data.get("recipe", "")),
+        status=str(data.get("status", "")),
+        title=str(data.get("title", "Analysis Result")),
+        summary=str(data.get("summary", "")),
+        tables=tuple(tables),
+        metrics=metrics if isinstance(metrics, dict) else {},
+        warnings=tuple(str(warning) for warning in warnings) if isinstance(warnings, list) else (),
+        created_at=str(data.get("created_at", "")),
+    )
+
+
+def _escape_md_cell(val: Any) -> str:
+    if val is None:
+        return ""
+    if isinstance(val, (bytes, bytearray, memoryview)):
+        return "<binary>"
+    return str(val).replace("|", "\\|").replace("\n", "<br>")
+
+
+def _markdown_table_lines(columns: Sequence[str], rows: Sequence[Sequence[Any]]) -> list[str]:
+    if not columns:
+        return ["No columns."]
+    headers = " | ".join(_escape_md_cell(column) for column in columns)
+    sep = " | ".join("---" for _ in columns)
+    lines = [f"| {headers} |", f"| {sep} |"]
+    for row in rows:
+        row_str = " | ".join(_escape_md_cell(value) for value in row)
+        lines.append(f"| {row_str} |")
+    return lines
+
+
+def _analysis_artifact_markdown_lines(
+    analysis: AnalysisArtifact,
+    *,
+    heading_level: int = 1,
+) -> list[str]:
+    heading = "#" * heading_level
+    subheading = "#" * (heading_level + 1)
+    lines = [
+        f"{heading} Analysis #{analysis.analysis_id}: {analysis.title}",
+        "",
+        f"- **Source Artifact**: #{analysis.source_artifact_id}",
+        f"- **Created**: {analysis.created_at}",
+        f"- **Recipe**: {analysis.recipe}",
+        f"- **Status**: {analysis.status}",
+        "",
+    ]
+    if analysis.summary:
+        lines.extend([analysis.summary, ""])
+    if analysis.metrics:
+        lines.extend([f"{subheading} Metrics", ""])
+        rows = tuple((key, value) for key, value in analysis.metrics.items())
+        lines.extend(_markdown_table_lines(("Field", "Value"), rows))
+        lines.append("")
+    if analysis.warnings:
+        lines.extend([f"{subheading} Warnings", ""])
+        lines.extend(f"- {warning}" for warning in analysis.warnings)
+        lines.append("")
+    for table in analysis.tables:
+        lines.extend([f"{subheading} {table.title}", ""])
+        lines.extend(_markdown_table_lines(table.columns, table.rows))
+        lines.append("")
+    return lines
+
+
+def _analysis_artifact_markdown(analysis: AnalysisArtifact) -> str:
+    return "\n".join(_analysis_artifact_markdown_lines(analysis)).rstrip() + "\n"
+
+
 def sanitize_workspace_name(name: str) -> str:
     """Reduce a user-supplied workspace name to a filesystem-safe stem.
 
@@ -2029,9 +2228,12 @@ def _next_workspace_path(base_dir: Path, name: str | None = None) -> Path:
 
 
 def save_artifact_workspace(
-    settings: Settings, artifacts: Sequence[ResultArtifact], name: str | None = None
+    settings: Settings,
+    artifacts: Sequence[ResultArtifact],
+    name: str | None = None,
+    analyses: Sequence[AnalysisArtifact] = (),
 ) -> WorkspaceSaveResult:
-    """Persist the session's artifacts to OUTPUT_DIR/workspaces/<dir> (explicit save; no model/SQL)."""
+    """Persist session artifacts and executed analysis summaries under OUTPUT_DIR/workspaces."""
     if not artifacts:
         raise AppError("No artifacts to save.")
     workspaces_dir = settings.output_path / "workspaces"
@@ -2040,6 +2242,7 @@ def save_artifact_workspace(
     workspace_path.mkdir(parents=True, exist_ok=False)
 
     entries: list[dict[str, Any]] = []
+    artifact_ids = {artifact.artifact_id for artifact in artifacts}
     for index, artifact in enumerate(artifacts, start=1):
         csv_file = f"artifact_{index:03d}.csv"
         sql_file = f"artifact_{index:03d}.sql"
@@ -2069,15 +2272,49 @@ def save_artifact_workspace(
             }
         )
 
+    linked_analyses = tuple(
+        analysis for analysis in analyses if analysis.source_artifact_id in artifact_ids
+    )
+    analysis_entries: list[dict[str, Any]] = []
+    for index, analysis in enumerate(linked_analyses, start=1):
+        json_file = f"analysis_{index:03d}.json"
+        markdown_file = f"analysis_{index:03d}.md"
+        (workspace_path / json_file).write_text(
+            json.dumps(_analysis_artifact_to_dict(analysis), indent=2),
+            encoding="utf-8",
+        )
+        (workspace_path / markdown_file).write_text(
+            _analysis_artifact_markdown(analysis),
+            encoding="utf-8",
+        )
+        analysis_entries.append(
+            {
+                "analysis_id": analysis.analysis_id,
+                "source_artifact_id": analysis.source_artifact_id,
+                "recipe": analysis.recipe,
+                "status": analysis.status,
+                "title": analysis.title,
+                "json_file": json_file,
+                "markdown_file": markdown_file,
+                "created_at": analysis.created_at,
+            }
+        )
+
     manifest = {
         "format_version": WORKSPACE_FORMAT_VERSION,
         "app_version": _app_version(),
         "created_at": utc_now(),
         "artifact_count": len(artifacts),
+        "analysis_count": len(linked_analyses),
         "artifacts": entries,
+        "analyses": analysis_entries,
     }
     (workspace_path / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    return WorkspaceSaveResult(path=workspace_path, artifact_count=len(artifacts))
+    return WorkspaceSaveResult(
+        path=workspace_path,
+        artifact_count=len(artifacts),
+        analysis_count=len(linked_analyses),
+    )
 
 
 def list_saved_workspaces(settings: Settings) -> tuple[Path, ...]:
@@ -2129,7 +2366,7 @@ def resolve_workspace_target(workspaces_dir: Path, target: str) -> Path:
 
 
 def load_artifact_workspace(settings: Settings, target: str) -> WorkspaceLoadResult:
-    """Reconstruct artifacts from a saved workspace. Loaded CSV cells are strings (CSV is untyped)."""
+    """Reconstruct artifacts from a workspace. Loaded CSV cells are strings because CSV is untyped."""
     workspaces_dir = settings.output_path / "workspaces"
     workspace_path = resolve_workspace_target(workspaces_dir, target)
 
@@ -2161,6 +2398,10 @@ def load_artifact_workspace(settings: Settings, target: str) -> WorkspaceLoadRes
 
         columns = tuple(table[0]) if table else ()
         rows = tuple(tuple(row) for row in table[1:])
+        if any(len(row) != len(columns) for row in rows):
+            raise AppError(
+                f"Invalid workspace artifact CSV {csv_file}: row width does not match header."
+            )
         artifacts.append(
             ResultArtifact(
                 artifact_id=entry.get("artifact_id", len(artifacts) + 1),
@@ -2173,7 +2414,33 @@ def load_artifact_workspace(settings: Settings, target: str) -> WorkspaceLoadRes
                 created_at=entry.get("created_at", ""),
             )
         )
-    return WorkspaceLoadResult(artifacts=tuple(artifacts), path=workspace_path)
+
+    analysis_entries = manifest.get("analyses", [])
+    if not isinstance(analysis_entries, list):
+        raise AppError("Invalid workspace manifest: analyses must be a list.")
+
+    analyses: list[AnalysisArtifact] = []
+    for entry in analysis_entries:
+        if not isinstance(entry, dict):
+            raise AppError("Invalid workspace manifest: analysis entry must be an object.")
+        json_file = entry.get("json_file")
+        if not json_file:
+            raise AppError("Invalid workspace manifest: analysis entry missing json_file.")
+        try:
+            data = json.loads((workspace_path / json_file).read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise AppError("Invalid analysis artifact: JSON root must be an object.")
+            analyses.append(_analysis_artifact_from_dict(data))
+        except AppError:
+            raise
+        except (OSError, ValueError, TypeError) as exc:
+            raise AppError(f"Could not read workspace analysis files: {exc}") from exc
+
+    return WorkspaceLoadResult(
+        artifacts=tuple(artifacts),
+        path=workspace_path,
+        analyses=tuple(analyses),
+    )
 
 
 def inspect_workspace(settings, target: str) -> WorkspaceInfo:
@@ -2316,7 +2583,7 @@ def artifact_rows_as_dicts(artifact: ResultArtifact) -> list[dict[str, object]]:
     (e.g. "count", "count__2"); resolve_column is given the same names so lookups match.
     """
     names = make_unique_column_names(artifact.columns)
-    return [dict(zip(names, row)) for row in artifact.rows]
+    return [dict(zip(names, row, strict=True)) for row in artifact.rows]
 
 
 # --- v3.4: controlled artifact transformations -----------------------------------------
@@ -3151,6 +3418,7 @@ def validate_with_repair(
         result.repaired = True
         result.token_usage = add_usage(result.token_usage, repaired.usage)
         validate_sql(result.sql, tables)
+        result.validation_error = None
         return repair_budget - 1
 
 
@@ -3448,9 +3716,91 @@ def _markdown_fence(text: str, language: str = "") -> str:
     return f"{fence}{suffix}\n{text}\n{fence}"
 
 
+def _linked_analyses_by_artifact(
+    artifacts: Sequence[ResultArtifact],
+    analyses: Sequence[AnalysisArtifact],
+) -> dict[int, tuple[AnalysisArtifact, ...]]:
+    artifact_ids = {artifact.artifact_id for artifact in artifacts}
+    grouped: dict[int, list[AnalysisArtifact]] = {artifact_id: [] for artifact_id in artifact_ids}
+    for analysis in analyses:
+        if analysis.source_artifact_id in grouped:
+            grouped[analysis.source_artifact_id].append(analysis)
+    return {artifact_id: tuple(items) for artifact_id, items in grouped.items()}
+
+
+def _linked_analyses(
+    artifacts: Sequence[ResultArtifact],
+    analyses: Sequence[AnalysisArtifact],
+) -> tuple[AnalysisArtifact, ...]:
+    artifact_ids = {artifact.artifact_id for artifact in artifacts}
+    return tuple(analysis for analysis in analyses if analysis.source_artifact_id in artifact_ids)
+
+
+def _analysis_artifact_html_parts(analysis: AnalysisArtifact) -> list[str]:
+    import html
+
+    def cell(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return "&lt;binary&gt;"
+        return html.escape(str(value))
+
+    parts = [
+        '    <article class="analysis-artifact">',
+        f"      <h4>Analysis #{analysis.analysis_id}: {html.escape(analysis.title)}</h4>",
+        f"      <p><strong>Source Artifact:</strong> #{analysis.source_artifact_id}</p>",
+        f"      <p><strong>Created:</strong> {html.escape(analysis.created_at)}</p>",
+        f"      <p><strong>Recipe:</strong> {html.escape(analysis.recipe)}</p>",
+        f"      <p><strong>Status:</strong> {html.escape(analysis.status)}</p>",
+    ]
+    if analysis.summary:
+        parts.append(f"      <p>{html.escape(analysis.summary)}</p>")
+    if analysis.metrics:
+        parts.append("      <h5>Metrics</h5>")
+        parts.append("      <table>")
+        parts.append("        <thead><tr><th>Field</th><th>Value</th></tr></thead>")
+        parts.append("        <tbody>")
+        for key, value in analysis.metrics.items():
+            parts.append(
+                f"          <tr><td>{html.escape(str(key))}</td><td>{cell(value)}</td></tr>"
+            )
+        parts.append("        </tbody>")
+        parts.append("      </table>")
+    if analysis.warnings:
+        parts.append("      <h5>Warnings</h5>")
+        parts.append("      <ul>")
+        for warning in analysis.warnings:
+            parts.append(f"        <li>{html.escape(warning)}</li>")
+        parts.append("      </ul>")
+    for table in analysis.tables:
+        parts.append(f"      <h5>{html.escape(table.title)}</h5>")
+        if table.columns:
+            parts.append("      <table>")
+            parts.append("        <thead>")
+            parts.append("          <tr>")
+            for column in table.columns:
+                parts.append(f"            <th>{html.escape(column)}</th>")
+            parts.append("          </tr>")
+            parts.append("        </thead>")
+            parts.append("        <tbody>")
+            for row in table.rows:
+                parts.append("          <tr>")
+                for value in row:
+                    parts.append(f"            <td>{cell(value)}</td>")
+                parts.append("          </tr>")
+            parts.append("        </tbody>")
+            parts.append("      </table>")
+        else:
+            parts.append("      <p>No columns.</p>")
+    parts.append("    </article>")
+    return parts
+
+
 def render_artifact_report_markdown(
     artifacts: Sequence[ResultArtifact],
     *,
+    analyses: Sequence[AnalysisArtifact] = (),
     title: str = "Artifact Report",
     max_preview_rows: int = 50,
 ) -> str:
@@ -3458,23 +3808,19 @@ def render_artifact_report_markdown(
         raise AppError("No artifacts to report.")
 
     report_time = utc_now()
+    analyses_by_source = _linked_analyses_by_artifact(artifacts, analyses)
+    linked_analysis_count = sum(len(items) for items in analyses_by_source.values())
 
     lines = []
     lines.append(f"# {title}")
     lines.append("")
     lines.append(f"- **Created**: {report_time}")
     lines.append(f"- **Artifacts**: {len(artifacts)}")
+    lines.append(f"- **Analyses**: {linked_analysis_count}")
     lines.append("")
     lines.append("> [!NOTE]")
-    lines.append("> Report uses stored artifact rows only. No SQL was re-run.")
+    lines.append("> Report uses stored artifact rows and analysis digests only. No SQL was re-run.")
     lines.append("")
-
-    def escape_md_cell(val: Any) -> str:
-        if val is None:
-            return ""
-        if isinstance(val, (bytes, bytearray, memoryview)):
-            return "<binary>"
-        return str(val).replace("|", "\\|")
 
     for art in artifacts:
         lines.append("---")
@@ -3494,13 +3840,7 @@ def render_artifact_report_markdown(
 
         lines.append("### Preview")
         if art.columns:
-            headers = " | ".join(escape_md_cell(col) for col in art.columns)
-            sep = " | ".join("---" for _ in art.columns)
-            lines.append(f"| {headers} |")
-            lines.append(f"| {sep} |")
-            for row in art.rows[:max_preview_rows]:
-                row_str = " | ".join(escape_md_cell(val) for val in row)
-                lines.append(f"| {row_str} |")
+            lines.extend(_markdown_table_lines(art.columns, art.rows[:max_preview_rows]))
         else:
             lines.append("No columns.")
         lines.append("")
@@ -3514,12 +3854,20 @@ def render_artifact_report_markdown(
             lines.append(_markdown_fence(art.analysis_text))
             lines.append("")
 
+        linked_analyses = analyses_by_source.get(art.artifact_id, ())
+        if linked_analyses:
+            lines.append("### Saved Analyses")
+            lines.append("")
+            for analysis in linked_analyses:
+                lines.extend(_analysis_artifact_markdown_lines(analysis, heading_level=4))
+
     return "\n".join(lines)
 
 
 def render_artifact_report_html(
     artifacts: Sequence[ResultArtifact],
     *,
+    analyses: Sequence[AnalysisArtifact] = (),
     title: str = "Artifact Report",
     max_preview_rows: int = 50,
 ) -> str:
@@ -3529,6 +3877,8 @@ def render_artifact_report_html(
     import html
 
     report_time = utc_now()
+    analyses_by_source = _linked_analyses_by_artifact(artifacts, analyses)
+    linked_analysis_count = sum(len(items) for items in analyses_by_source.values())
 
     def escape_html_val(val: Any) -> str:
         if val is None:
@@ -3553,13 +3903,15 @@ def render_artifact_report_html(
     html_parts.append("    th { background-color: #f5f5f5; }")
     html_parts.append("    pre { background-color: #f9f9f9; padding: 10px; border: 1px solid #eee; overflow-x: auto; }")
     html_parts.append("    code { font-family: monospace; }")
+    html_parts.append("    .analysis-artifact { border-left: 4px solid #d0e3ff; padding-left: 12px; margin: 14px 0; }")
     html_parts.append("  </style>")
     html_parts.append("</head>")
     html_parts.append("<body>")
     html_parts.append(f"  <h1>{html.escape(title)}</h1>")
     html_parts.append(f"  <p><strong>Created:</strong> {html.escape(report_time)}</p>")
     html_parts.append(f"  <p><strong>Artifacts:</strong> {len(artifacts)}</p>")
-    html_parts.append('  <div class="warning-note">Report uses stored artifact rows only. No SQL was re-run.</div>')
+    html_parts.append(f"  <p><strong>Analyses:</strong> {linked_analysis_count}</p>")
+    html_parts.append('  <div class="warning-note">Report uses stored artifact rows and analysis digests only. No SQL was re-run.</div>')
 
     for art in artifacts:
         html_parts.append("  <section>")
@@ -3600,6 +3952,12 @@ def render_artifact_report_html(
             html_parts.append("    <h3>Analysis</h3>")
             html_parts.append(f"    <pre><code>{html.escape(art.analysis_text)}</code></pre>")
 
+        linked_analyses = analyses_by_source.get(art.artifact_id, ())
+        if linked_analyses:
+            html_parts.append("    <h3>Saved Analyses</h3>")
+            for analysis in linked_analyses:
+                html_parts.extend(_analysis_artifact_html_parts(analysis))
+
         html_parts.append("  </section>")
 
     html_parts.append("</body>")
@@ -3613,6 +3971,7 @@ def export_artifact_report(
     *,
     report_format: str,
     include_all: bool = False,
+    analyses: Sequence[AnalysisArtifact] = (),
 ) -> ReportExportResult:
     fmt = report_format.strip().lower()
     if fmt in {"md", "markdown"}:
@@ -3628,6 +3987,7 @@ def export_artifact_report(
         raise AppError("No artifacts to report.")
 
     to_report = artifacts if include_all else [artifacts[-1]]
+    to_report_analyses = _linked_analyses(to_report, analyses)
 
     reports_dir = Path(settings.output_path) / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
@@ -3635,9 +3995,9 @@ def export_artifact_report(
     file_path = _next_report_path(reports_dir, suffix)
 
     if normalized_format == "markdown":
-        content = render_artifact_report_markdown(to_report)
+        content = render_artifact_report_markdown(to_report, analyses=to_report_analyses)
     else:
-        content = render_artifact_report_html(to_report)
+        content = render_artifact_report_html(to_report, analyses=to_report_analyses)
 
     file_path.write_text(content, encoding="utf-8")
 
@@ -3645,6 +4005,7 @@ def export_artifact_report(
         path=file_path,
         artifact_count=len(to_report),
         format=normalized_format,
+        analysis_count=len(to_report_analyses),
     )
 
 
@@ -3660,6 +4021,5 @@ def export_workspace_report(
         loaded.artifacts,
         report_format=report_format,
         include_all=True,
+        analyses=loaded.analyses,
     )
-
-

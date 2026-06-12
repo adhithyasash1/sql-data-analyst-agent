@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Annotated
 
@@ -11,8 +13,15 @@ from rich.prompt import Confirm, Prompt
 from rich.syntax import Syntax
 from rich.table import Table
 
+from analysis.capabilities import analyze_dataset_capability, suggest_analyses
+from analysis.executor import AnalysisExecutionResult, execute_analysis_plan
+from analysis.ml_runner import SupervisedRunResult, run_supervised_model
+from analysis.planner import AnalysisPlan, plan_analysis
+from analysis.supervised import SupervisedPreflight, build_supervised_preflight
 from config import Settings
 from core import (
+    AnalysisArtifact,
+    AnalysisArtifactTable,
     AppError,
     NORTHWIND_DOWNLOAD_SHA,
     NORTHWIND_DOWNLOAD_URL,
@@ -32,6 +41,7 @@ from core import (
     list_saved_workspaces,
     load_artifact_workspace,
     make_result_artifact,
+    materialize_artifact_rows,
     parse_colon_command,
     parse_count,
     parse_key_value_args,
@@ -39,6 +49,7 @@ from core import (
     route_artifact_followup,
     save_artifact_workspace,
     transform_artifact,
+    utc_now,
     verify_sqlite_database,
 )
 
@@ -57,13 +68,15 @@ ARTIFACT_HELP = """Artifact commands (operate on the last result):
   :select ...    New artifact with subset of columns (columns=<col1,col2,...>)
   :filter ...    New filtered artifact (column=<col> op=<op> value=<val>)
   :groupby ...   New aggregated artifact (by=<col> metric=<col> agg=<agg>)
-  :save [name=<name>]  Save session's artifacts to OUTPUT_DIR/workspaces
+  :analyze ...   Plan or run deterministic analysis for the latest result (--run for ML)
+  :save [name=<name>]  Save session artifacts and executed analysis digests
   :saved         List saved workspaces
   :workspace-info <workspace>    Show saved workspace details
   :delete-workspace <workspace>  Delete a saved workspace
-  :load <workspace>              Load a saved workspace
+  :load <workspace>              Load saved artifacts and analysis digests
   :report <md|html> [all|workspace=<workspace>]  Export artifact report
   :artifacts     List this session's results
+  :analyses      List executed analyses recorded in this session
   :help          Show this help
   :q / quit / exit  Quit the assistant"""
 
@@ -169,6 +182,7 @@ def ask(
         )
     )
     artifacts: list[ResultArtifact] = []
+    analyses: list[AnalysisArtifact] = []
     while True:
         user_input = Prompt.ask("[bold]You[/bold]").strip()
         if not user_input:
@@ -180,7 +194,7 @@ def ask(
             name, arg = command
             if name in {"q", "quit", "exit"}:
                 break
-            handle_artifact_command(name, arg, artifacts, settings, verbose)
+            handle_artifact_command(name, arg, artifacts, analyses, settings, verbose)
             continue
         if artifacts:
             try:
@@ -191,7 +205,14 @@ def ask(
             if route is not None:
                 target = f":{route.command}" if not route.arg else f":{route.command} {route.arg}"
                 console.print(f"[dim]Routed to {target}[/dim]")
-                handle_artifact_command(route.command, route.arg, artifacts, settings, verbose)
+                handle_artifact_command(
+                    route.command,
+                    route.arg,
+                    artifacts,
+                    analyses,
+                    settings,
+                    verbose,
+                )
                 continue
         result = run_question(settings, client, user_input, verbose)
         if result.success and result.sql and result.columns:
@@ -273,6 +294,7 @@ def handle_artifact_command(
     name: str,
     arg: str,
     artifacts: list[ResultArtifact],
+    analyses: list[AnalysisArtifact],
     settings: Settings,
     verbose: bool,
 ) -> None:
@@ -282,17 +304,28 @@ def handle_artifact_command(
     if name == "artifacts":
         render_artifacts(artifacts)
         return
+    if name == "analyses":
+        render_analyses(analyses)
+        return
     if name == "save":
         try:
             options = parse_key_value_args(arg)
             unknown = set(options) - {"name"}
             if unknown:
                 raise AppError(f"Unknown option(s) for save: {', '.join(sorted(unknown))}")
-            saved = save_artifact_workspace(settings, artifacts, name=options.get("name"))
+            saved = save_artifact_workspace(
+                settings,
+                artifacts,
+                name=options.get("name"),
+                analyses=analyses,
+            )
         except AppError as exc:
             console.print(Panel(str(exc), title="Save failed", border_style="yellow"))
             return
-        console.print(f"[green]Saved[/green] {saved.artifact_count} artifacts to {saved.path}")
+        console.print(
+            f"[green]Saved[/green] {saved.artifact_count} artifacts and "
+            f"{saved.analysis_count} analyses to {saved.path}"
+        )
         return
     if name == "saved":
         workspaces = list_saved_workspaces(settings)
@@ -351,8 +384,10 @@ def handle_artifact_command(
             console.print(Panel(str(exc), title="Load failed", border_style="yellow"))
             return
         artifacts[:] = list(loaded.artifacts)
+        analyses[:] = list(loaded.analyses)
         console.print(
-            f"[green]Loaded[/green] {len(loaded.artifacts)} artifacts from {loaded.path}"
+            f"[green]Loaded[/green] {len(loaded.artifacts)} artifacts and "
+            f"{len(loaded.analyses)} analyses from {loaded.path}"
         )
         return
     if name == "report":
@@ -391,8 +426,10 @@ def handle_artifact_command(
                     workspace_target,
                     report_format=format_str,
                 )
+                analysis_word = "analysis" if result.analysis_count == 1 else "analyses"
                 console.print(
-                    f"Saved {result.format} report for {result.artifact_count} workspace artifact(s) to {result.path}"
+                    f"Saved {result.format} report for {result.artifact_count} workspace artifact(s) "
+                    f"and {result.analysis_count} {analysis_word} to {result.path}"
                 )
                 return
 
@@ -405,10 +442,13 @@ def handle_artifact_command(
                 artifacts,
                 report_format=format_str,
                 include_all=include_all,
+                analyses=analyses,
             )
             suffix_s = "s" if result.artifact_count != 1 else ""
+            analysis_word = "analysis" if result.analysis_count == 1 else "analyses"
             console.print(
-                f"Saved {result.format} report for {result.artifact_count} artifact{suffix_s} to {result.path}"
+                f"Saved {result.format} report for {result.artifact_count} artifact{suffix_s} "
+                f"and {result.analysis_count} {analysis_word} to {result.path}"
             )
         except AppError as exc:
             console.print(Panel(str(exc), title="Report failed", border_style="yellow"))
@@ -462,6 +502,129 @@ def handle_artifact_command(
             return
         console.print(f"[green]Saved chart[/green] {chart.path}")
         console.print(f"Chart type: {chart.chart_type}; rows plotted: {chart.row_count}")
+    elif name == "analyze":
+        if not arg.strip():
+            console.print(
+                Panel(
+                    "Usage: :analyze <profile|correlate|predict <column>|explain <column>> [--run]",
+                    title="Analyze",
+                    border_style="yellow",
+                )
+            )
+            return
+        analysis_request, run_requested = parse_analysis_run_request(arg)
+        capability = analyze_dataset_capability(last.columns, last.rows, truncated=last.truncated)
+        plan = plan_analysis(analysis_request, capability)
+        if plan.recipe == "profile" and plan.status == "ready":
+            result = execute_analysis_plan(plan, capability, last.columns, last.rows)
+            render_analysis_execution(result)
+            record_analysis_execution_result(analyses, last, result)
+        elif plan.recipe == "correlation" and plan.status == "ready":
+            analysis_columns = last.columns
+            analysis_rows = last.rows
+            analysis_capability = capability
+            analysis_plan = plan
+            allow_bounded_rows = False
+            extra_warnings: tuple[str, ...] = ()
+
+            if plan.row_scope == "bounded_refetch":
+                try:
+                    analysis_columns, analysis_rows, analysis_truncated = (
+                        materialize_artifact_rows(settings, last)
+                    )
+                except AppError as exc:
+                    console.print(Panel(str(exc), title="Analyze failed", border_style="yellow"))
+                    return
+                analysis_capability = analyze_dataset_capability(
+                    analysis_columns,
+                    analysis_rows,
+                    truncated=analysis_truncated,
+                )
+                analysis_plan = plan_analysis(analysis_request, analysis_capability)
+                allow_bounded_rows = True
+                extra_warnings = (
+                    f"Analysis used up to MAX_ANALYSIS_ROWS={settings.max_analysis_rows} "
+                    "rows from the validated SQL.",
+                )
+                if analysis_truncated:
+                    extra_warnings += (
+                        f"Result was capped at MAX_ANALYSIS_ROWS={settings.max_analysis_rows}; "
+                        "more rows may exist.",
+                    )
+
+            result = execute_analysis_plan(
+                analysis_plan,
+                analysis_capability,
+                analysis_columns,
+                analysis_rows,
+                allow_bounded_rows=allow_bounded_rows,
+            )
+            if extra_warnings:
+                result = replace(result, warnings=result.warnings + extra_warnings)
+            render_analysis_execution(result)
+            record_analysis_execution_result(analyses, last, result)
+        elif plan.recipe in {"predict", "explain"}:
+            analysis_columns = last.columns
+            analysis_rows = last.rows
+            analysis_capability = capability
+            analysis_plan = plan
+            analysis_row_scope = plan.row_scope
+            extra_warnings: tuple[str, ...] = ()
+
+            if plan.target_column is not None and plan.row_scope == "bounded_refetch":
+                try:
+                    analysis_columns, analysis_rows, analysis_truncated = (
+                        materialize_artifact_rows(settings, last)
+                    )
+                except AppError as exc:
+                    console.print(Panel(str(exc), title="Analyze failed", border_style="yellow"))
+                    return
+                analysis_capability = analyze_dataset_capability(
+                    analysis_columns,
+                    analysis_rows,
+                    truncated=analysis_truncated,
+                )
+                analysis_plan = plan_analysis(analysis_request, analysis_capability)
+                analysis_row_scope = "bounded_refetch"
+                extra_warnings = (
+                    f"Preflight used up to MAX_ANALYSIS_ROWS={settings.max_analysis_rows} "
+                    "rows from the validated SQL.",
+                )
+                if analysis_truncated:
+                    extra_warnings += (
+                        f"Result was capped at MAX_ANALYSIS_ROWS={settings.max_analysis_rows}; "
+                        "more rows may exist.",
+                    )
+
+            if analysis_plan.target_column is None:
+                render_analysis_plan(analysis_plan)
+                return
+
+            preflight = build_supervised_preflight(
+                analysis_plan,
+                analysis_capability,
+                analysis_columns,
+                analysis_rows,
+                row_scope=analysis_row_scope,
+                extra_warnings=extra_warnings,
+            )
+            if run_requested:
+                if preflight.can_execute:
+                    run_result = run_supervised_model(
+                        preflight,
+                        analysis_capability,
+                        analysis_columns,
+                        analysis_rows,
+                    )
+                    render_supervised_run_result(run_result)
+                    record_supervised_run_result(analyses, last, run_result)
+                else:
+                    render_supervised_preflight(preflight)
+                    console.print("[yellow]Run blocked by supervised preflight.[/yellow]")
+            else:
+                render_supervised_preflight(preflight)
+        else:
+            render_analysis_plan(plan)
     elif name in {"sort", "select", "filter", "groupby"}:
         try:
             transformed = transform_artifact(last, name, arg, len(artifacts) + 1)
@@ -500,6 +663,126 @@ def render_artifacts(artifacts: list[ResultArtifact]) -> None:
     console.print(table)
 
 
+def render_analyses(analyses: list[AnalysisArtifact]) -> None:
+    if not analyses:
+        console.print("No executed analyses yet.")
+        return
+    table = Table(title=f"{len(analyses)} session analysis artifact(s)")
+    table.add_column("ID", justify="right")
+    table.add_column("Source", justify="right")
+    table.add_column("Recipe")
+    table.add_column("Status")
+    table.add_column("Title")
+    table.add_column("Created")
+    for analysis in analyses:
+        table.add_row(
+            str(analysis.analysis_id),
+            f"#{analysis.source_artifact_id}",
+            analysis.recipe,
+            analysis.status,
+            preview(analysis.title, 48),
+            analysis.created_at,
+        )
+    console.print(table)
+
+
+def record_analysis_execution_result(
+    analyses: list[AnalysisArtifact],
+    source: ResultArtifact,
+    result: AnalysisExecutionResult,
+) -> None:
+    if result.status != "success":
+        return
+    analysis = analysis_artifact_from_execution(len(analyses) + 1, source, result)
+    analyses.append(analysis)
+    console.print(
+        f"[green]Recorded analysis #{analysis.analysis_id}[/green] for artifact "
+        f"#{analysis.source_artifact_id}."
+    )
+
+
+def record_supervised_run_result(
+    analyses: list[AnalysisArtifact],
+    source: ResultArtifact,
+    result: SupervisedRunResult,
+) -> None:
+    if result.status not in {"success", "weak_signal"}:
+        return
+    analysis = analysis_artifact_from_supervised_run(len(analyses) + 1, source, result)
+    analyses.append(analysis)
+    console.print(
+        f"[green]Recorded analysis #{analysis.analysis_id}[/green] for artifact "
+        f"#{analysis.source_artifact_id}."
+    )
+
+
+def analysis_artifact_from_execution(
+    analysis_id: int,
+    source: ResultArtifact,
+    result: AnalysisExecutionResult,
+) -> AnalysisArtifact:
+    return AnalysisArtifact(
+        analysis_id=analysis_id,
+        source_artifact_id=source.artifact_id,
+        recipe=result.recipe,
+        status=result.status,
+        title=result.title,
+        summary=result.summary,
+        tables=_analysis_tables_from_result_tables(result.tables),
+        warnings=result.warnings,
+        created_at=utc_now(),
+    )
+
+
+def analysis_artifact_from_supervised_run(
+    analysis_id: int,
+    source: ResultArtifact,
+    result: SupervisedRunResult,
+) -> AnalysisArtifact:
+    target = result.target_column or "unknown target"
+    metrics = {
+        "target_column": target,
+        "problem_type": result.problem_type,
+        "row_scope": result.row_scope,
+        "features": ", ".join(result.feature_columns),
+        "baseline": result.baseline_name,
+        "model": result.model_name,
+        "metric": result.metric_name,
+        "baseline_metric": result.baseline_metric,
+        "model_metric": result.model_metric,
+        "secondary_metric": result.secondary_metric_name,
+        "secondary_baseline_metric": result.secondary_baseline_metric,
+        "secondary_model_metric": result.secondary_model_metric,
+        "rows_used": result.rows_used,
+        "rows_dropped_missing_target": result.rows_dropped_missing_target,
+        "train_rows": result.train_rows,
+        "test_rows": result.test_rows,
+    }
+    return AnalysisArtifact(
+        analysis_id=analysis_id,
+        source_artifact_id=source.artifact_id,
+        recipe=result.recipe,
+        status=result.status,
+        title=f"{result.recipe.title()} Run: {target}",
+        summary=result.message,
+        tables=_analysis_tables_from_result_tables(result.tables),
+        metrics=metrics,
+        warnings=result.warnings,
+        created_at=utc_now(),
+    )
+
+
+def _analysis_tables_from_result_tables(tables) -> tuple[AnalysisArtifactTable, ...]:
+    return tuple(
+        AnalysisArtifactTable(
+            title=table.title,
+            columns=tuple(table.columns),
+            rows=tuple(tuple(row) for row in table.rows),
+        )
+        for table in tables
+    )
+
+
 def render_answer(result, verbose: bool) -> None:
     if result.error_message and not result.success:
         console.print(Panel(result.error_message, title="Error", border_style="red"))
@@ -525,6 +808,7 @@ def render_answer(result, verbose: bool) -> None:
         )
     if result.summary:
         console.print(Panel(result.summary, title="Summary", border_style="green"))
+    render_analysis_suggestions(result.columns, result.rows, result.truncated)
 
     if verbose:
         diagnostics = [
@@ -540,6 +824,153 @@ def render_answer(result, verbose: bool) -> None:
             f"Analysis: {result.analysis_text or result.analysis_error or 'disabled'}",
         ]
         console.print(Panel("\n".join(diagnostics), title="Diagnostics"))
+
+
+def render_analysis_suggestions(
+    columns: tuple[str, ...],
+    rows: tuple[tuple[object, ...], ...],
+    truncated: bool,
+) -> None:
+    capability = analyze_dataset_capability(columns, rows, truncated=truncated)
+    suggestions = suggest_analyses(capability)
+    if not suggestions:
+        return
+    lines = [f"- {suggestion.message}" for suggestion in suggestions]
+    if any(suggestion.recipe == "visualize" for suggestion in suggestions) and not _viz_available():
+        lines.append("- Chart rendering needs the optional viz extra: `uv sync --extra viz`.")
+    if capability.truncated:
+        lines.append(
+            "- Heavier ML should use a bounded re-fetch because the displayed rows are truncated."
+        )
+    console.print(Panel("\n".join(lines), title="Recommended next steps", border_style="magenta"))
+
+
+def _viz_available() -> bool:
+    return find_spec("matplotlib") is not None
+
+
+def render_analysis_plan(plan: AnalysisPlan) -> None:
+    table = Table(title="Analysis Plan")
+    table.add_column("Field", style="bold cyan")
+    table.add_column("Value")
+    table.add_row("Status", plan.status)
+    table.add_row("Recipe", plan.recipe)
+    table.add_row("Target", plan.target_column or "none")
+    table.add_row("Rows", str(plan.row_count))
+    table.add_row("Row scope", plan.row_scope)
+    table.add_row("Confirmation required", "yes" if plan.confirmation_required else "no")
+    table.add_row("Message", plan.message)
+    if plan.feature_columns:
+        table.add_row("Features", ", ".join(plan.feature_columns))
+    if plan.excluded_columns:
+        excluded = ", ".join(
+            f"{item.column} ({item.reason})" for item in plan.excluded_columns[:8]
+        )
+        if len(plan.excluded_columns) > 8:
+            excluded += f", +{len(plan.excluded_columns) - 8} more"
+        table.add_row("Excluded", excluded)
+    if plan.warnings:
+        table.add_row("Warnings", "\n".join(plan.warnings))
+    console.print(table)
+    console.print("[dim]Plan only: no ML model was fitted or executed.[/dim]")
+
+
+def render_analysis_execution(result: AnalysisExecutionResult) -> None:
+    console.print(Panel(result.summary, title=result.title, border_style="cyan"))
+    for result_table in result.tables:
+        table = Table(title=result_table.title)
+        for column in result_table.columns:
+            table.add_column(column)
+        for row in result_table.rows:
+            table.add_row(*(format_cell(value) for value in row))
+        console.print(table)
+    if result.warnings:
+        console.print(Panel("\n".join(result.warnings), title="Analysis warnings", border_style="yellow"))
+    console.print("[dim]Deterministic analysis only: no ML model was fitted.[/dim]")
+
+
+def render_supervised_preflight(preflight: SupervisedPreflight) -> None:
+    table = Table(title="Supervised ML Preflight")
+    table.add_column("Field", style="bold cyan")
+    table.add_column("Value")
+    table.add_row("Status", preflight.status)
+    table.add_row("Recipe", preflight.recipe)
+    table.add_row("Target", preflight.target_column or "none")
+    table.add_row("Problem type", preflight.problem_type)
+    table.add_row("Rows used", str(preflight.row_count))
+    table.add_row("Row scope", preflight.row_scope)
+    table.add_row("Eligible features", _join_preview(preflight.eligible_features))
+    blockers = tuple(gate.reason for gate in preflight.gates if gate.status == "block")
+    table.add_row("Blockers", "\n".join(blockers) if blockers else "none")
+    table.add_row("Warnings", "\n".join(preflight.warnings) if preflight.warnings else "none")
+    table.add_row("Baseline", preflight.baseline_recipe)
+    table.add_row(
+        "Next action",
+        "Ready for a future explicit model run." if preflight.can_execute else "Fix blockers first.",
+    )
+    console.print(table)
+
+    features = Table(title="Feature Assessment")
+    features.add_column("Column")
+    features.add_column("Status")
+    features.add_column("Reason")
+    for assessment in preflight.feature_assessments[:20]:
+        features.add_row(assessment.column, assessment.status, assessment.reason)
+    if len(preflight.feature_assessments) > 20:
+        features.add_row(
+            f"+{len(preflight.feature_assessments) - 20} more",
+            "hidden",
+            "feature list truncated for display",
+        )
+    console.print(features)
+    console.print("[dim]Preflight only: no scikit-learn model was fitted.[/dim]")
+
+
+def render_supervised_run_result(result: SupervisedRunResult) -> None:
+    console.print(Panel(result.message, title="Supervised ML Run", border_style="cyan"))
+    summary = Table(title="Run Summary")
+    summary.add_column("Field", style="bold cyan")
+    summary.add_column("Value")
+    summary.add_row("Status", result.status)
+    summary.add_row("Recipe", result.recipe)
+    summary.add_row("Target", result.target_column or "none")
+    summary.add_row("Problem type", result.problem_type)
+    summary.add_row("Row scope", result.row_scope)
+    summary.add_row("Features", _join_preview(result.feature_columns))
+    summary.add_row("Baseline", result.baseline_name)
+    summary.add_row("Model", result.model_name)
+    summary.add_row("Rows used", str(result.rows_used))
+    summary.add_row("Rows dropped missing target", str(result.rows_dropped_missing_target))
+    summary.add_row("Train rows", str(result.train_rows))
+    summary.add_row("Test rows", str(result.test_rows))
+    console.print(summary)
+
+    for result_table in result.tables:
+        table = Table(title=result_table.title)
+        for column in result_table.columns:
+            table.add_column(column)
+        for row in result_table.rows:
+            table.add_row(*(format_cell(value) for value in row))
+        console.print(table)
+    if result.warnings:
+        console.print(Panel("\n".join(result.warnings), title="ML warnings", border_style="yellow"))
+    console.print("[dim]ML run digest only: no model, predictions, or materialized rows are saved.[/dim]")
+
+
+def parse_analysis_run_request(arg: str) -> tuple[str, bool]:
+    tokens = arg.split()
+    run_requested = "--run" in tokens
+    request = " ".join(token for token in tokens if token != "--run")
+    return request.strip(), run_requested
+
+
+def _join_preview(values: tuple[str, ...], *, limit: int = 8) -> str:
+    if not values:
+        return "none"
+    text = ", ".join(values[:limit])
+    if len(values) > limit:
+        text += f", +{len(values) - limit} more"
+    return text
 
 
 def render_rows(columns: tuple[str, ...], rows: tuple[tuple[object, ...], ...], truncated: bool) -> None:

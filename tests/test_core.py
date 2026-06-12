@@ -13,6 +13,8 @@ import pytest
 import core
 from core import (
     AnswerResult,
+    AnalysisArtifact,
+    AnalysisArtifactTable,
     AppError,
     IndexStateError,
     ResultArtifact,
@@ -45,7 +47,6 @@ from core import (
     make_unique_column_names,
     metadata_connection,
     ArtifactTransformResult,
-    RoutedArtifactCommand,
     _compare_values,
     parse_colon_command,
     parse_count,
@@ -343,6 +344,24 @@ def test_shape_expectation_uses_question_subject_before_metric_object() -> None:
     assert employee.entity_terms == ("first", "last", "name")
 
 
+def test_shape_expectation_treats_most_recent_as_temporal_order() -> None:
+    expectation = infer_shape_expectation("List the 10 most recent orders.")
+    assert expectation.requires_order is True
+    assert expectation.order_direction == "DESC"
+    assert expectation.requires_numeric is False
+    assert expectation.aggregate_kind is None
+    assert expectation.expected_limit == 10
+
+
+def test_shape_expectation_does_not_count_country_substring() -> None:
+    expectation = infer_shape_expectation(
+        "List order id, ship country, order date, and freight for orders."
+    )
+    assert expectation.requires_numeric is False
+    assert expectation.aggregate_kind is None
+    assert expectation.requires_order is False
+
+
 def test_empty_results_are_summarized_without_repair_signal() -> None:
     summary = deterministic_summary("List discontinued products", ("ProductName",), (), False)
     assert summary == "The query returned no rows."
@@ -389,6 +408,32 @@ def test_deterministic_summary_does_not_treat_ids_as_metrics() -> None:
         False,
     )
     assert summary == "Returned 1 row."
+
+
+def test_deterministic_summary_does_not_rank_detail_recency_by_metric() -> None:
+    summary = deterministic_summary(
+        "List the 10 most recent invoices.",
+        ("InvoiceId", "CustomerId", "InvoiceDate", "Total"),
+        (
+            (412, 58, "2025-12-22 00:00:00", 1.99),
+            (411, 44, "2025-11-13 00:00:00", 25.86),
+        ),
+        False,
+    )
+    assert summary == "Returned 2 rows."
+
+
+def test_deterministic_summary_does_not_rank_detail_list_by_freight() -> None:
+    summary = deterministic_summary(
+        "List order id, employee id, ship via, ship country, ship city, order date, and freight for orders.",
+        ("OrderID", "EmployeeID", "ShipVia", "ShipCountry", "ShipCity", "OrderDate", "Freight"),
+        (
+            (10248, 5, 3, "France", "Reims", "2016-07-04", 16.75),
+            (10263, 9, 3, "Austria", "Graz", "2016-07-23", 56),
+        ),
+        False,
+    )
+    assert summary == "Returned 2 rows."
 
 
 class FakeEmbeddingData:
@@ -696,7 +741,9 @@ def test_answer_question_repairs_invalid_sql(db_path: Path, tmp_path: Path) -> N
     result = answer_question(settings, client, "Which customers do we have?")  # type: ignore[arg-type]
     assert result.success is True
     assert result.repaired is True
-    assert result.validation_error is not None
+    assert result.validation_error is None
+    assert result.repair_reason is not None
+    assert result.repair_reason.startswith("validation failed:")
     assert result.sql == "SELECT CompanyName FROM Customers ORDER BY CompanyName"
 
 
@@ -1226,6 +1273,29 @@ def _make_artifact(rows: tuple[tuple[object, ...], ...], **overrides: object) ->
     )
     base.update(overrides)
     return ResultArtifact(**base)  # type: ignore[arg-type]
+
+
+def _make_analysis(**overrides: object) -> AnalysisArtifact:
+    base: dict[str, object] = dict(
+        analysis_id=1,
+        source_artifact_id=1,
+        recipe="profile",
+        status="success",
+        title="Profile Result",
+        summary="Profiled 2 rows.",
+        tables=(
+            AnalysisArtifactTable(
+                title="Column Profile",
+                columns=("Column", "Type", "Rows"),
+                rows=(("x", "numeric", 2),),
+            ),
+        ),
+        metrics={"rows_used": 2, "score": 0.5},
+        warnings=("Treat as directional.",),
+        created_at="2026-06-08T00:01:00+00:00",
+    )
+    base.update(overrides)
+    return AnalysisArtifact(**base)  # type: ignore[arg-type]
 
 
 def test_parse_colon_command_variants() -> None:
@@ -1764,6 +1834,56 @@ def test_load_workspace_round_trips(tmp_path: Path) -> None:
     assert restored.artifact_id == source.artifact_id
 
 
+def test_load_workspace_rejects_csv_row_width_mismatch(tmp_path: Path) -> None:
+    settings = _workspace_settings(tmp_path)
+    saved = save_artifact_workspace(settings, [_genre_rows_artifact()], name="genre_revenue")
+
+    # Corrupt the stored CSV with a row narrower than the header
+    with (saved.path / "artifact_001.csv").open("a", newline="", encoding="utf-8") as handle:
+        handle.write("Rock,1\n")
+
+    with pytest.raises(AppError, match="row width does not match header"):
+        load_artifact_workspace(settings, saved.path.name)
+
+
+def test_save_workspace_persists_linked_analysis_artifacts(tmp_path: Path) -> None:
+    settings = _workspace_settings(tmp_path)
+    artifact = _genre_rows_artifact()
+    linked = _make_analysis(source_artifact_id=artifact.artifact_id)
+    orphan = _make_analysis(analysis_id=2, source_artifact_id=999)
+
+    saved = save_artifact_workspace(
+        settings,
+        [artifact],
+        name="genre_revenue",
+        analyses=[linked, orphan],
+    )
+
+    assert saved.analysis_count == 1
+    assert (saved.path / "analysis_001.json").is_file()
+    assert (saved.path / "analysis_001.md").is_file()
+    assert not (saved.path / "analysis_002.json").exists()
+
+    manifest = json.loads((saved.path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["analysis_count"] == 1
+    analysis_entry = manifest["analyses"][0]
+    assert analysis_entry["analysis_id"] == linked.analysis_id
+    assert analysis_entry["source_artifact_id"] == artifact.artifact_id
+    assert analysis_entry["json_file"] == "analysis_001.json"
+    assert analysis_entry["markdown_file"] == "analysis_001.md"
+
+    loaded = load_artifact_workspace(settings, saved.path.name)
+    assert len(loaded.analyses) == 1
+    restored = loaded.analyses[0]
+    assert restored.analysis_id == linked.analysis_id
+    assert restored.source_artifact_id == artifact.artifact_id
+    assert restored.recipe == "profile"
+    assert restored.status == "success"
+    assert restored.tables[0].rows == (("x", "numeric", 2),)
+    assert restored.metrics["rows_used"] == 2
+    assert restored.warnings == ("Treat as directional.",)
+
+
 def test_load_workspace_unique_prefix(tmp_path: Path) -> None:
     settings = _workspace_settings(tmp_path)
     save_artifact_workspace(settings, [_genre_rows_artifact()], name="uniquename")
@@ -1944,7 +2064,7 @@ def test_transform_metadata_and_truncated_semantics() -> None:
 
 def test_markdown_report_rendering() -> None:
     # empty artifacts raises AppError
-    with pytest.raises(AppError, match="No artifacts to report."):
+    with pytest.raises(AppError, match=r"No artifacts to report\."):
         core.render_artifact_report_markdown([])
 
     artifact = _make_artifact(
@@ -1974,7 +2094,33 @@ def test_markdown_report_rendering() -> None:
     assert "### Analysis" in report
     assert "Some profile description here." in report
     # stored rows warning is present
-    assert "Report uses stored artifact rows only. No SQL was re-run." in report
+    assert "Report uses stored artifact rows and analysis digests only. No SQL was re-run." in report
+
+
+def test_markdown_report_includes_linked_analysis_artifacts() -> None:
+    artifact = _make_artifact(
+        rows=((1,),),
+        columns=("x",),
+        artifact_id=1,
+        question="Q1",
+    )
+    linked = _make_analysis(source_artifact_id=1)
+    unrelated = _make_analysis(analysis_id=2, source_artifact_id=999, title="Unrelated")
+
+    report = core.render_artifact_report_markdown(
+        [artifact],
+        analyses=[linked, unrelated],
+    )
+
+    assert "- **Analyses**: 1" in report
+    assert "### Saved Analyses" in report
+    assert "#### Analysis #1: Profile Result" in report
+    assert "| Field | Value |" in report
+    assert "| rows_used | 2 |" in report
+    assert "| x | numeric | 2 |" in report
+    assert "Treat as directional." in report
+    assert "Unrelated" not in report
+
 
 def test_markdown_report_rendering_backticks_fence() -> None:
     # SQL containing triple backticks
@@ -2000,7 +2146,7 @@ def test_markdown_report_preview_cap_note() -> None:
 
 def test_html_report_rendering() -> None:
     # empty artifacts raises AppError
-    with pytest.raises(AppError, match="No artifacts to report."):
+    with pytest.raises(AppError, match=r"No artifacts to report\."):
         core.render_artifact_report_html([])
 
     artifact = _make_artifact(
@@ -2026,7 +2172,26 @@ def test_html_report_rendering() -> None:
     assert "<h3>Analysis</h3>" in report
     assert "<pre><code>Test profile &lt;info&gt;</code></pre>" in report
     # stored rows warning is present
-    assert "Report uses stored artifact rows only. No SQL was re-run." in report
+    assert "Report uses stored artifact rows and analysis digests only. No SQL was re-run." in report
+
+
+def test_html_report_includes_linked_analysis_artifacts() -> None:
+    artifact = _make_artifact(
+        rows=((1,),),
+        columns=("x",),
+        artifact_id=1,
+        question="Q1",
+    )
+    analysis = _make_analysis(title="Profile <Result>", source_artifact_id=1)
+
+    report = core.render_artifact_report_html([artifact], analyses=[analysis])
+
+    assert "<strong>Analyses:</strong> 1" in report
+    assert "Saved Analyses" in report
+    assert "Analysis #1: Profile &lt;Result&gt;" in report
+    assert "<td>rows_used</td><td>2</td>" in report
+    assert "<td>x</td>" in report
+
 
 def test_html_report_preview_cap_note() -> None:
     # preview row cap note appears
@@ -2081,6 +2246,30 @@ def test_export_artifact_report_behavior(tmp_path: Path) -> None:
     assert res_all.artifact_count == 2
     assert res_all.path.read_text(encoding="utf-8").count("## Artifact #") == 2
 
+    analyses = [
+        _make_analysis(analysis_id=1, source_artifact_id=1, title="Analysis for Q1"),
+        _make_analysis(analysis_id=2, source_artifact_id=2, title="Analysis for Q2"),
+    ]
+    res_latest_analysis = core.export_artifact_report(
+        settings,
+        artifacts,
+        report_format="md",
+        analyses=analyses,
+    )
+    latest_content = res_latest_analysis.path.read_text(encoding="utf-8")
+    assert res_latest_analysis.analysis_count == 1
+    assert "Analysis for Q2" in latest_content
+    assert "Analysis for Q1" not in latest_content
+
+    res_all_analysis = core.export_artifact_report(
+        settings,
+        artifacts,
+        report_format="md",
+        include_all=True,
+        analyses=analyses,
+    )
+    assert res_all_analysis.analysis_count == 2
+
     # two exports create distinct file paths
     res_a = core.export_artifact_report(settings, artifacts, report_format="md")
     res_b = core.export_artifact_report(settings, artifacts, report_format="md")
@@ -2104,13 +2293,16 @@ def test_export_workspace_report(tmp_path: Path) -> None:
     )
     artifacts = [art1, art2]
 
+    analysis = _make_analysis(source_artifact_id=2)
+
     # Save to a workspace first
-    saved = save_artifact_workspace(settings, artifacts, name="test_ws")
+    save_artifact_workspace(settings, artifacts, name="test_ws", analyses=[analysis])
 
     # Export workspace report as Markdown
     res = core.export_workspace_report(settings, "test_ws", report_format="md")
     assert res.path.suffix == ".md"
     assert res.artifact_count == 2
+    assert res.analysis_count == 1
     assert res.format == "markdown"
 
     report_content = res.path.read_text(encoding="utf-8")
@@ -2118,6 +2310,7 @@ def test_export_workspace_report(tmp_path: Path) -> None:
     assert "## Artifact #2" in report_content
     assert "Q1" in report_content
     assert "Q2" in report_content
+    assert "#### Analysis #1: Profile Result" in report_content
 
     # Unknown workspace raises AppError
     with pytest.raises(AppError, match="No workspace found"):
@@ -2246,7 +2439,7 @@ def test_resolve_workspace_target_validation(tmp_path: Path) -> None:
     workspaces_dir.mkdir()
     
     # Empty target
-    with pytest.raises(AppError, match="Usage: :load <workspace>."):
+    with pytest.raises(AppError, match=r"Usage: :load <workspace>\."):
         core.resolve_workspace_target(workspaces_dir, "")
         
     # Absolute path
@@ -2279,7 +2472,3 @@ def test_resolve_workspace_target_validation(tmp_path: Path) -> None:
         
     # Exact match works
     assert core.resolve_workspace_target(workspaces_dir, "genre_revenue_a") == ws1
-
-
-
-

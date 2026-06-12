@@ -18,6 +18,12 @@ analysis = [
     "pandas>=2.0.0",
     "pyarrow>=15.0.0",
 ]
+ml = [
+    "numpy>=1.26.0",
+    "pandas>=2.0.0",
+    "pyarrow>=15.0.0",
+    "scikit-learn>=1.4.0",
+]
 viz = [
     "matplotlib>=3.8.0",
 ]
