@@ -38,8 +38,14 @@ from core import (
     index_schema,
     inspect_workspace,
     delete_workspace,
+    decompose_question,
+    extract_schema,
     list_saved_workspaces,
+    run_agent,
+    run_goal,
+    llm_route_followup,
     load_artifact_workspace,
+    synthesize_multi_answer,
     make_result_artifact,
     materialize_artifact_rows,
     parse_colon_command,
@@ -69,6 +75,8 @@ ARTIFACT_HELP = """Artifact commands (operate on the last result):
   :filter ...    New filtered artifact (column=<col> op=<op> value=<val>)
   :groupby ...   New aggregated artifact (by=<col> metric=<col> agg=<agg>)
   :analyze ...   Plan or run deterministic analysis for the latest result (--run for ML)
+  :multi <question>  Decompose a complex question into sub-questions, run each, synthesize
+  :goal <objective>  Let the model work toward a goal using deterministic artifact commands
   :save [name=<name>]  Save session artifacts and executed analysis digests
   :saved         List saved workspaces
   :workspace-info <workspace>    Show saved workspace details
@@ -160,6 +168,13 @@ def ask(
         typer.Option("--metadata-db", hidden=True, help="Advanced: override the per-database metadata DB."),
     ] = None,
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Show diagnostics.")] = False,
+    agent: Annotated[
+        bool,
+        typer.Option(
+            "--agent",
+            help="Answer with the bounded multi-step agent loop (explore, query, analyze).",
+        ),
+    ] = False,
 ) -> None:
     """Ask a question once, or start the interactive prompt when no question is supplied."""
     settings = load_settings(db, metadata_db)
@@ -169,6 +184,14 @@ def ask(
     except AppError as exc:
         console.print(Panel(str(exc), title="Configuration error", border_style="red"))
         raise typer.Exit(1) from exc
+
+    if agent:
+        if not question:
+            console.print(
+                Panel('Agent mode needs a question: ask --agent "<question>"', border_style="yellow")
+            )
+            raise typer.Exit(1)
+        raise typer.Exit(run_agent_question(settings, client, question))
 
     if question:
         result = run_question(settings, client, question, verbose)
@@ -200,6 +223,12 @@ def ask(
             name, arg = command
             if name in {"q", "quit", "exit"}:
                 break
+            if name == "multi":
+                run_multi_question(settings, client, arg, artifacts, verbose)
+                continue
+            if name == "goal":
+                run_goal_session(settings, client, arg, artifacts)
+                continue
             handle_artifact_command(name, arg, artifacts, analyses, settings, verbose)
             continue
         if artifacts:
@@ -208,9 +237,12 @@ def ask(
             except AppError as exc:
                 console.print(Panel(str(exc), title="Could not route", border_style="yellow"))
                 continue
+            if route is None and settings.enable_llm_router_fallback:
+                route = llm_route_followup(client, settings, user_input, artifacts[-1].columns)
             if route is not None:
+                suffix = " (model-routed)" if route.reason == "llm-fallback" else ""
                 target = f":{route.command}" if not route.arg else f":{route.command} {route.arg}"
-                console.print(f"[dim]Routed to {target}[/dim]")
+                console.print(f"[dim]Routed to {target}{suffix}[/dim]")
                 handle_artifact_command(
                     route.command,
                     route.arg,
@@ -298,6 +330,133 @@ def run_question(settings: Settings, client, question: str, verbose: bool):
         )
     render_answer(result, verbose)
     return result
+
+
+def run_multi_question(
+    settings: Settings,
+    client,
+    question: str,
+    artifacts: list[ResultArtifact],
+    verbose: bool,
+) -> None:
+    """Decompose a complex question, answer each sub-question, and synthesize.
+
+    Every sub-question runs through the full validated pipeline and stores a normal
+    session artifact, so all artifact commands work on the intermediate results.
+    """
+    question = question.strip()
+    if not question:
+        console.print(
+            Panel("Usage: :multi <question>", title="Multi-step question", border_style="yellow")
+        )
+        return
+    sub_questions = decompose_question(client, settings, question) or [question]
+    console.print(
+        Panel(
+            "\n".join(f"{index}. {sub}" for index, sub in enumerate(sub_questions, 1)),
+            title=f"Plan: {len(sub_questions)} sub-question(s)",
+        )
+    )
+    answered: list[ResultArtifact] = []
+    for sub in sub_questions:
+        try:
+            result = run_question(settings, client, sub, verbose)
+        except KeyboardInterrupt:
+            console.print("[dim]Multi-step question cancelled.[/dim]")
+            return
+        if result.success and result.sql and result.columns:
+            artifact = make_result_artifact(len(artifacts) + 1, result)
+            artifacts.append(artifact)
+            answered.append(artifact)
+    if not answered:
+        console.print(Panel("No sub-question produced a result.", border_style="yellow"))
+        return
+    if len(answered) > 1:
+        synthesis = synthesize_multi_answer(client, settings, question, answered)
+        if synthesis:
+            console.print(Panel(synthesis, title="Synthesis", border_style="green"))
+
+
+def run_agent_question(settings: Settings, client, question: str) -> int:
+    """One-shot agent mode: bounded explore/query/analyze loop with a final answer."""
+
+    def approve(sql: str) -> bool:
+        console.print(
+            Panel(Syntax(sql, "sql", theme="monokai", word_wrap=True), title="Agent SQL")
+        )
+        return Confirm.ask("Execute this query?", default=False)
+
+    tables = extract_schema(settings.source_db_path)
+    try:
+        with console.status("Agent working (explore, query, analyze)..."):
+            outcome = run_agent(
+                client,
+                settings,
+                question,
+                tables,
+                approval_callback=approve if settings.require_sql_approval else None,
+            )
+    except KeyboardInterrupt:
+        console.print("[dim]Agent cancelled.[/dim]")
+        return 130
+    for step in outcome.steps:
+        detail = f"({step.detail})" if step.detail else ""
+        note = f" - {step.thought}" if step.thought else ""
+        console.print(f"[dim]Step: {step.action}{detail}{note}[/dim]")
+    if outcome.artifacts:
+        latest = outcome.artifacts[-1]
+        table = Table(title=f"Agent result (artifact #{latest.artifact_id})")
+        for column in latest.columns:
+            table.add_column(column)
+        for row in latest.rows[:20]:
+            table.add_row(*["" if value is None else str(value) for value in row])
+        console.print(table)
+    if outcome.answer:
+        console.print(Panel(outcome.answer, title="Agent answer", border_style="green"))
+        return 0
+    console.print(Panel("Agent ended without an answer.", border_style="yellow"))
+    return 1
+
+
+def run_goal_session(
+    settings: Settings,
+    client,
+    goal: str,
+    artifacts: list[ResultArtifact],
+) -> None:
+    """Run :goal - model-chosen deterministic steps over the latest artifact."""
+    goal = goal.strip()
+    if not goal:
+        console.print(
+            Panel("Usage: :goal <objective>", title="Goal mode", border_style="yellow")
+        )
+        return
+    if not artifacts:
+        console.print(
+            Panel("No result to analyze. Ask a question first.", border_style="yellow")
+        )
+        return
+    try:
+        with console.status("Working toward the goal..."):
+            outcome = run_goal(client, settings, goal, artifacts)
+    except KeyboardInterrupt:
+        console.print("[dim]Goal cancelled.[/dim]")
+        return
+    for step in outcome.steps:
+        command = f":{step.action} {step.arg}".strip()
+        note = f" - {step.thought}" if step.thought else ""
+        console.print(f"[dim]Step: {command}{note}[/dim]")
+    if outcome.artifacts_created:
+        console.print(
+            f"[dim]{outcome.artifacts_created} new artifact(s) created; "
+            "the latest reflects the steps taken.[/dim]"
+        )
+    if outcome.findings:
+        console.print(Panel(outcome.findings, title="Findings", border_style="green"))
+    else:
+        console.print(
+            Panel("Goal ended without explicit findings.", border_style="yellow")
+        )
 
 
 def handle_artifact_command(

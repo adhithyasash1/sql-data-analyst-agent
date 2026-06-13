@@ -1187,11 +1187,24 @@ def shape_expectation_text(expectation: ShapeExpectation) -> str:
     return "\n".join(lines)
 
 
+def fewshot_examples_text(examples: Sequence[tuple[str, str]]) -> str:
+    """Render past successful question->SQL pairs as a prompt section ('' when empty)."""
+    if not examples:
+        return ""
+    lines = ["Past successful queries for this database (guidance, not ground truth):"]
+    for past_question, past_sql in examples:
+        lines.append(f"Q: {past_question}")
+        lines.append(f"SQL: {past_sql}")
+    return "\n".join(lines) + "\n"
+
+
 def build_sql_prompt(
     question: str,
     schema_text: str,
     max_result_rows: int,
     expectation: ShapeExpectation,
+    examples: Sequence[tuple[str, str]] = (),
+    exploration: Sequence["ExplorationStep"] = (),
 ) -> str:
     return f"""You are an expert SQLite query generator.
 Generate exactly one read-only SQLite SELECT query for the user's question.
@@ -1214,7 +1227,7 @@ Rules:
 - Return only SQL. Do not use markdown fences.
 Expected result shape:
 {shape_expectation_text(expectation)}
-Relevant schema:
+{exploration_notes_text(exploration)}{fewshot_examples_text(examples)}Relevant schema:
 {schema_text}
 User question:
 {question}
@@ -1235,6 +1248,17 @@ SQL_REPAIR_RULES = """Rules:
 - Do not use comments or prohibited operations."""
 
 
+def repair_attempts_text(previous_attempts: Sequence[tuple[str, str]]) -> str:
+    """Render earlier failed repair attempts as a prompt section ('' when empty)."""
+    if not previous_attempts:
+        return ""
+    lines = ["Earlier failed attempts (do not repeat these):"]
+    for attempt_sql, attempt_error in previous_attempts:
+        lines.append(f"SQL: {attempt_sql}")
+        lines.append(f"Error: {attempt_error}")
+    return "\n".join(lines) + "\n\n"
+
+
 def build_validation_repair_prompt(
     question: str,
     schema_text: str,
@@ -1242,6 +1266,7 @@ def build_validation_repair_prompt(
     validation_error: str,
     max_result_rows: int,
     expectation: ShapeExpectation,
+    previous_attempts: Sequence[tuple[str, str]] = (),
 ) -> str:
     rules = SQL_REPAIR_RULES.format(quote_guidance=quote_guidance(), max_result_rows=max_result_rows)
     return f"""The previous SQL was invalid or unsafe.
@@ -1253,7 +1278,7 @@ Return only SQL.
 Expected result shape:
 {shape_expectation_text(expectation)}
 
-Validation error:
+{repair_attempts_text(previous_attempts)}Validation error:
 {validation_error}
 
 Invalid SQL:
@@ -3331,6 +3356,788 @@ def summarize_result(
         return fallback, "deterministic", str(exc)
 
 
+def extract_json_object(raw: str) -> dict[str, Any] | None:
+    """Parse the first complete JSON object out of a model reply.
+
+    Tolerates code fences, leading prose, and trailing junk - including replies
+    that contain several JSON objects (only the first is used).
+    """
+    text = raw.strip()
+    decoder = json.JSONDecoder()
+    index = text.find("{")
+    while index != -1:
+        try:
+            parsed, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            index = text.find("{", index + 1)
+            continue
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def request_json_payload(
+    client: OpenAI,
+    settings: Settings,
+    *,
+    model: str,
+    system: str,
+    prompt: str,
+    max_tokens: int = 4000,
+) -> dict[str, Any] | None:
+    """One JSON-reply model call shared by all agentic helpers.
+
+    Best-effort: model errors and unparseable replies yield None. The generous
+    default token budget lets reasoning models finish thinking before the JSON
+    (servers like oMLX stream thinking into a separate reasoning_content field,
+    but only when the reply is not cut off mid-thought); extract_json_object then
+    pulls the first object out of the content. Constrained decoding via
+    response_format is deliberately not used: it garbles the thinking phase on
+    reasoning models.
+    """
+    del settings  # reserved for future per-call settings; keeps call sites uniform
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+            top_p=1.0,
+            max_tokens=max_tokens,
+        )
+    except openai.OpenAIError:
+        return None
+    return extract_json_object(response.choices[0].message.content or "")
+
+
+LLM_ROUTABLE_COMMANDS = frozenset(
+    {
+        "describe",
+        "head",
+        "tail",
+        "export",
+        "sql",
+        "columns",
+        "artifacts",
+        "plot",
+        "sort",
+        "select",
+        "filter",
+        "groupby",
+    }
+)
+
+ROUTER_FALLBACK_PROMPT = """You map a user's follow-up request about an existing SQL result table to one CLI command.
+Result columns: {columns}
+Allowed commands and argument syntax:
+- describe (no argument)
+- head <N> / tail <N>
+- sql / columns / artifacts (no argument)
+- export csv
+- plot bar x=<col> y=<col> | plot line x=<col> y=<col> | plot scatter x=<col> y=<col> | plot hist column=<col>
+- sort column=<col> order=<asc|desc>
+- select columns=<col1,col2,...>
+- filter column=<col> op=<eq|ne|gt|gte|lt|lte|contains> value=<v>
+- groupby by=<col> metric=<col> agg=<sum|mean|count|min|max>
+Use only the listed column names, spelled exactly as given.
+Reply with exactly one JSON object and nothing else - no explanation, no reasoning, no markdown:
+{{"command": "<name>", "arg": "<argument string or empty>"}}
+If the request is not clearly about the existing result, or no allowed command fits, return {{"command": "none", "arg": ""}}.
+
+User request:
+{text}
+
+JSON:"""
+
+
+def llm_route_followup(
+    client: OpenAI, settings: Settings, text: str, columns: Sequence[str]
+) -> RoutedArtifactCommand | None:
+    """Model-assisted fallback for follow-ups the deterministic router could not parse.
+
+    The model only *chooses* among the read-only/transform artifact commands; the
+    choice is validated against an allowlist and executed by the same deterministic
+    handlers as a typed colon command. Workspace and analysis commands are never
+    routable this way, and any model or parse failure simply yields no route.
+    """
+    prompt = ROUTER_FALLBACK_PROMPT.format(columns=", ".join(columns), text=text)
+    payload = request_json_payload(
+        client,
+        settings,
+        model=settings.text_to_sql_model,
+        system=(
+            "You route requests to CLI commands. Reply with one JSON object only. "
+            "Never explain or show reasoning."
+        ),
+        prompt=prompt,
+    )
+    if not payload:
+        return None
+    command = str(payload.get("command") or "").strip().lower()
+    arg = str(payload.get("arg") or "").strip()
+    if command not in LLM_ROUTABLE_COMMANDS:
+        return None
+    return RoutedArtifactCommand(command, arg, "llm-fallback")
+
+
+@dataclass(frozen=True)
+class ResultCritique:
+    matches: bool
+    reason: str
+
+
+CRITIC_PROMPT = """You judge whether a SQL result plausibly answers the user's question.
+Reply with exactly one JSON object and nothing else - no explanation, no reasoning, no markdown:
+{{"matches": true, "reason": "<one short sentence>"}}
+or
+{{"matches": false, "reason": "<one short sentence>"}}
+Be conservative: when unsure, return matches=true.
+
+User question:
+{question}
+
+Executed SQL:
+{sql}
+
+Result digest:
+{digest}
+
+JSON:"""
+
+
+def result_digest_for_critic(
+    columns: Sequence[str],
+    rows: Sequence[Sequence[object]],
+    truncated: bool,
+    max_preview: int = 5,
+) -> str:
+    """Compact deterministic digest of an executed result for the critic prompt."""
+    suffix = " (display truncated)" if truncated else ""
+    lines = [f"Columns: {', '.join(columns)}", f"Row count: {len(rows)}{suffix}"]
+    for row in rows[:max_preview]:
+        lines.append(" | ".join("" if value is None else str(value) for value in row))
+    if len(rows) > max_preview:
+        lines.append(f"... {len(rows) - max_preview} more rows")
+    return "\n".join(lines)
+
+
+def critique_result(
+    client: OpenAI,
+    settings: Settings,
+    question: str,
+    sql: str,
+    execution: ExecutionResult,
+) -> ResultCritique | None:
+    """Ask the model whether the executed result answers the question.
+
+    Pure reflection: the verdict is advisory and surfaces as a warning. Best-effort
+    like the router fallback - any model or parse failure yields no critique.
+    """
+    digest = result_digest_for_critic(execution.columns, execution.rows, execution.truncated)
+    prompt = CRITIC_PROMPT.format(question=question, sql=sql, digest=digest)
+    payload = request_json_payload(
+        client,
+        settings,
+        model=settings.summary_model,
+        system=(
+            "You verify SQL results against questions. Reply with one JSON object "
+            "only. Never explain or show reasoning."
+        ),
+        prompt=prompt,
+    )
+    if not payload or not isinstance(payload.get("matches"), bool):
+        return None
+    return ResultCritique(matches=payload["matches"], reason=str(payload.get("reason") or ""))
+
+
+@dataclass(frozen=True)
+class ExplorationStep:
+    action: str
+    detail: str
+    observation: str
+
+
+SCHEMA_EXPLORATION_PROMPT = """You may inspect a SQLite database before SQL is written for the user's question.
+Reply with exactly one JSON object and nothing else - no explanation, no reasoning, no markdown.
+Choose one action per reply:
+{{"action": "list_tables"}}
+{{"action": "describe_table", "table": "<name>"}}
+{{"action": "sample_rows", "table": "<name>", "limit": <1-5>}}
+{{"action": "distinct_values", "table": "<name>", "column": "<name>", "limit": <1-10>}}
+{{"action": "done"}}
+Call a tool only when the schema summary is not enough to write correct SQL. Reply {{"action": "done"}} as soon as you know enough.
+
+User question:
+{question}
+
+Schema summary:
+{schema_text}
+
+Exploration so far:
+{transcript}
+
+JSON:"""
+
+
+def _resolve_schema_table(tables: list[TableSchema], requested: str) -> TableSchema | None:
+    for table in tables:
+        if table.name.lower() == requested.strip().lower():
+            return table
+    return None
+
+
+def _bounded_int(value: object, *, default: int, maximum: int) -> int:
+    try:
+        number = int(str(value))
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(number, maximum))
+
+
+def _format_exploration_rows(execution: ExecutionResult, max_chars: int = 800) -> str:
+    lines = [" | ".join(execution.columns)]
+    for row in execution.rows:
+        lines.append(" | ".join("" if value is None else str(value) for value in row))
+    return "\n".join(lines)[:max_chars]
+
+
+def execute_exploration_action(
+    settings: Settings,
+    tables: list[TableSchema],
+    action: str,
+    payload: dict[str, Any],
+) -> tuple[str | None, str]:
+    """Run one exploration tool deterministically. Returns (observation, detail).
+
+    Table and column names are resolved against the inspected schema before any SQL
+    is assembled, so the model can never inject identifiers; the only SQL shapes are
+    fixed SELECT/LIMIT templates through the read-only executor. An unknown action
+    returns observation None, which ends the exploration loop.
+    """
+    if action == "list_tables":
+        names = ", ".join(f"{table.name} ({table.kind})" for table in tables)
+        return f"Tables/views: {names}", ""
+
+    requested = str(payload.get("table") or "")
+    table = _resolve_schema_table(tables, requested)
+    if action == "describe_table":
+        if table is None:
+            return f"Unknown table: {requested}", requested
+        columns = ", ".join(f"{column.name} {column.data_type}" for column in table.columns)
+        relations = "; ".join(
+            f"{', '.join(fk.constrained_columns)} -> "
+            f"{fk.referred_table}({', '.join(fk.referred_columns)})"
+            for fk in table.foreign_keys
+        )
+        observation = f"Columns: {columns}"
+        if relations:
+            observation += f". Foreign keys: {relations}"
+        return observation, table.name
+
+    if action == "sample_rows":
+        if table is None:
+            return f"Unknown table: {requested}", requested
+        limit = _bounded_int(payload.get("limit"), default=3, maximum=5)
+        sql = f'SELECT * FROM "{table.name}" LIMIT {limit}'
+        try:
+            execution = execute_readonly_query(
+                settings.source_db_path,
+                sql,
+                max_rows=limit,
+                timeout_ms=settings.query_timeout_ms,
+            )
+        except QueryExecutionError as exc:
+            return f"Sample failed: {exc}", table.name
+        return _format_exploration_rows(execution), table.name
+
+    if action == "distinct_values":
+        if table is None:
+            return f"Unknown table: {requested}", requested
+        requested_column = str(payload.get("column") or "")
+        column = next(
+            (
+                col.name
+                for col in table.columns
+                if col.name.lower() == requested_column.strip().lower()
+            ),
+            None,
+        )
+        if column is None:
+            return f"Unknown column: {requested_column}", table.name
+        limit = _bounded_int(payload.get("limit"), default=10, maximum=10)
+        sql = f'SELECT DISTINCT "{column}" FROM "{table.name}" LIMIT {limit}'
+        try:
+            execution = execute_readonly_query(
+                settings.source_db_path,
+                sql,
+                max_rows=limit,
+                timeout_ms=settings.query_timeout_ms,
+            )
+        except QueryExecutionError as exc:
+            return f"Distinct failed: {exc}", f"{table.name}.{column}"
+        values = ", ".join(
+            "" if row[0] is None else str(row[0]) for row in execution.rows
+        )
+        return f"Distinct {column}: {values}"[:800], f"{table.name}.{column}"
+
+    return None, ""
+
+
+def explore_schema(
+    client: OpenAI,
+    settings: Settings,
+    question: str,
+    tables: list[TableSchema],
+    schema_text: str,
+) -> list[ExplorationStep]:
+    """Bounded pre-generation tool loop over read-only schema inspection tools.
+
+    The model chooses which tool to call next (or "done"); every tool runs through
+    the read-only executor with row and timeout caps. Any model failure, parse
+    failure, or unknown action ends the loop early. The transcript becomes
+    grounding context for SQL generation.
+    """
+    steps: list[ExplorationStep] = []
+    for _ in range(settings.max_exploration_calls):
+        transcript = (
+            "\n".join(f"{step.action}({step.detail}) -> {step.observation}" for step in steps)
+            or "(none yet)"
+        )
+        prompt = SCHEMA_EXPLORATION_PROMPT.format(
+            question=question, schema_text=schema_text, transcript=transcript
+        )
+        payload = request_json_payload(
+            client,
+            settings,
+            model=settings.text_to_sql_model,
+            system=(
+                "You inspect database schemas via tools. Reply with one JSON "
+                "object only. Never explain or show reasoning."
+            ),
+            prompt=prompt,
+        )
+        if not payload:
+            break
+        action = str(payload.get("action") or "").strip().lower()
+        if action == "done":
+            break
+        observation, detail = execute_exploration_action(settings, tables, action, payload)
+        if observation is None:
+            break
+        steps.append(ExplorationStep(action=action, detail=detail, observation=observation))
+    return steps
+
+
+def exploration_notes_text(steps: Sequence[ExplorationStep]) -> str:
+    """Render exploration steps as a prompt section ('' when empty)."""
+    if not steps:
+        return ""
+    lines = ["Exploration notes (from read-only database inspection):"]
+    for step in steps:
+        label = f"{step.action}({step.detail})" if step.detail else step.action
+        lines.append(f"- {label}: {step.observation}")
+    return "\n".join(lines) + "\n"
+
+
+DECOMPOSITION_PROMPT = """You break a complex database question into at most {max_subs} smaller sub-questions.
+Reply with exactly one JSON object and nothing else - no markdown:
+{{"thought": "<one short sentence of reasoning>", "sub_questions": ["<question 1>", "<question 2>"]}}
+Each sub-question must be plain English and self-contained. Do not write any SQL.
+If the question is already simple, return it alone in the list.
+
+User question:
+{question}
+
+JSON:"""
+
+
+def decompose_question(
+    client: OpenAI, settings: Settings, question: str, max_subs: int = 3
+) -> list[str]:
+    """Ask the model to split a question into SQL-answerable sub-questions.
+
+    Best-effort: a model error or unparseable reply returns [] and the caller
+    falls back to running the original question unchanged.
+    """
+    prompt = DECOMPOSITION_PROMPT.format(question=question, max_subs=max_subs)
+    payload = request_json_payload(
+        client,
+        settings,
+        model=settings.text_to_sql_model,
+        system=(
+            "You plan database questions. Reply with one JSON object only. "
+            "Never explain or show reasoning."
+        ),
+        prompt=prompt,
+    )
+    if not payload or not isinstance(payload.get("sub_questions"), list):
+        return []
+    sub_questions = [
+        str(item).strip() for item in payload["sub_questions"] if str(item).strip()
+    ]
+    return sub_questions[:max_subs]
+
+
+SYNTHESIS_PROMPT = """You combine the results of several sub-questions into one short grounded answer to the user's original question.
+Use only the data shown. State numbers exactly as given. Do not speculate beyond the data.
+Reply with exactly one JSON object and nothing else - no markdown:
+{{"thought": "<one short sentence>", "answer": "<2-5 plain sentences answering the original question>"}}
+
+Original question:
+{question}
+
+{sections}
+
+JSON:"""
+
+
+def synthesize_multi_answer(
+    client: OpenAI,
+    settings: Settings,
+    question: str,
+    artifacts: Sequence[ResultArtifact],
+) -> str | None:
+    """Grounded cross-result summary for :multi. Best-effort: model errors yield None."""
+    sections = "\n\n".join(
+        f"Sub-question {index}: {artifact.question}\n"
+        + result_digest_for_critic(artifact.columns, artifact.rows, artifact.truncated)
+        for index, artifact in enumerate(artifacts, 1)
+    )
+    prompt = SYNTHESIS_PROMPT.format(question=question, sections=sections)
+    payload = request_json_payload(
+        client,
+        settings,
+        model=settings.summary_model,
+        system="You summarize SQL results faithfully. Use only the data shown.",
+        prompt=prompt,
+    )
+    if not payload:
+        return None
+    answer = str(payload.get("answer") or "").strip()
+    return answer or None
+
+
+@dataclass(frozen=True)
+class GoalStep:
+    action: str
+    arg: str
+    thought: str
+    observation: str
+
+
+@dataclass(frozen=True)
+class GoalRunResult:
+    steps: tuple[GoalStep, ...]
+    findings: str | None
+    artifacts_created: int
+
+
+GOAL_PROMPT = """You are analyzing an in-memory SQL result table to satisfy the user's goal.
+You may apply deterministic commands; each transform creates a new latest table.
+Reply with exactly one JSON object and nothing else - no markdown:
+{{"thought": "<one short sentence>", "action": "<name>", "arg": "<argument string>"}}
+Actions and argument syntax:
+- describe (arg: "")
+- head (arg: "<N>")
+- sort (arg: "column=<col> order=<asc|desc>")
+- select (arg: "columns=<col1,col2,...>")
+- filter (arg: "column=<col> op=<eq|ne|gt|gte|lt|lte|contains> value=<v>")
+- groupby (arg: "by=<col> metric=<col> agg=<sum|mean|count|min|max>")
+- finish (arg: "<2-4 plain sentences: findings grounded in the observations>")
+Use only current column names exactly as shown. Finish as soon as the goal is met.
+
+Goal:
+{goal}
+
+Current table columns: {columns}
+Current table digest:
+{digest}
+
+Steps so far:
+{transcript}
+
+JSON:"""
+
+
+def execute_goal_action(
+    settings: Settings, artifacts: list[ResultArtifact], action: str, arg: str
+) -> str | None:
+    """Run one goal-mode action on the latest artifact. Returns the observation.
+
+    Transforms append a normal session artifact (which becomes the latest); a failed
+    action returns its error text as the observation so the model can adjust. An
+    unknown action returns None, which ends the goal loop. No SQL and no model call
+    happen here - this is the same deterministic layer as the typed colon commands.
+    """
+    latest = artifacts[-1]
+    if action == "describe":
+        return artifact_describe_text(settings, latest)
+    if action == "head":
+        count = _bounded_int(arg, default=5, maximum=20)
+        return result_digest_for_critic(
+            latest.columns, latest.rows[:count], False, max_preview=count
+        )
+    transforms = {
+        "sort": transform_artifact_sort,
+        "select": transform_artifact_select,
+        "filter": transform_artifact_filter,
+        "groupby": transform_artifact_groupby,
+    }
+    transform = transforms.get(action)
+    if transform is None:
+        return None
+    try:
+        outcome = transform(latest, arg, len(artifacts) + 1)
+    except AppError as exc:
+        return f"Action failed: {exc}"
+    artifacts.append(outcome.artifact)
+    return result_digest_for_critic(
+        outcome.artifact.columns, outcome.artifact.rows, outcome.artifact.truncated
+    )
+
+
+def run_goal(
+    client: OpenAI,
+    settings: Settings,
+    goal: str,
+    artifacts: list[ResultArtifact],
+) -> GoalRunResult:
+    """Model-driven loop over the deterministic artifact commands.
+
+    The model only chooses among audited actions with a step budget; every transform
+    is the same code path as the typed colon commands and lands in the session
+    artifact list, so the user can inspect or undo nothing - artifacts are additive.
+    """
+    steps: list[GoalStep] = []
+    findings: str | None = None
+    created = 0
+    for _ in range(settings.max_goal_steps):
+        latest = artifacts[-1]
+        names = make_unique_column_names(latest.columns)
+        digest = result_digest_for_critic(latest.columns, latest.rows, latest.truncated)
+        transcript = (
+            "\n".join(
+                f"{step.action}({step.arg}) -> {step.observation[:200]}" for step in steps
+            )
+            or "(none yet)"
+        )
+        prompt = GOAL_PROMPT.format(
+            goal=goal, columns=", ".join(names), digest=digest, transcript=transcript
+        )
+        payload = request_json_payload(
+            client,
+            settings,
+            model=settings.text_to_sql_model,
+            system=(
+                "You analyze SQL result tables with deterministic tools. "
+                "Reply with one JSON object only."
+            ),
+            prompt=prompt,
+        )
+        if not payload:
+            break
+        action = str(payload.get("action") or "").strip().lower()
+        arg = str(payload.get("arg") or "").strip()
+        thought = str(payload.get("thought") or "").strip()
+        if action == "finish":
+            findings = arg or None
+            break
+        before = len(artifacts)
+        observation = execute_goal_action(settings, artifacts, action, arg)
+        if observation is None:
+            break
+        created += len(artifacts) - before
+        steps.append(GoalStep(action=action, arg=arg, thought=thought, observation=observation))
+    return GoalRunResult(steps=tuple(steps), findings=findings, artifacts_created=created)
+
+
+@dataclass(frozen=True)
+class AgentStep:
+    action: str
+    detail: str
+    thought: str
+    observation: str
+
+
+@dataclass(frozen=True)
+class AgentRunResult:
+    steps: tuple[AgentStep, ...]
+    artifacts: tuple[ResultArtifact, ...]
+    answer: str | None
+
+
+AGENT_PROMPT = """You are a careful data analyst agent for one SQLite database.
+Work step by step toward answering the user's question. One action per reply.
+Reply with exactly one JSON object and nothing else - no markdown:
+{{"thought": "<one short sentence>", "action": "<name>", ...action fields}}
+Actions:
+- {{"action": "list_tables"}}
+- {{"action": "describe_table", "table": "<name>"}}
+- {{"action": "sample_rows", "table": "<name>", "limit": <1-5>}}
+- {{"action": "distinct_values", "table": "<name>", "column": "<name>", "limit": <1-10>}}
+- {{"action": "run_sql", "sql": "<one read-only SQLite SELECT query>"}}
+- {{"action": "describe"|"head"|"sort"|"select"|"filter"|"groupby", "arg": "<argument string>"}} (operates on the latest run_sql result)
+- {{"action": "finish", "answer": "<2-5 plain sentences answering the question, grounded in observations>"}}
+Rules:
+- SQL must be a single SELECT. No writes, comments, PRAGMA, or invented tables/columns.
+- Add LIMIT {max_result_rows} to detailed row queries.
+- Use exact table and column names from the schema.
+- Never repeat an action already shown in Steps so far; build on its observation.
+- Finish as soon as you can answer; quote numbers exactly as observed.
+
+User question:
+{question}
+
+Schema:
+{schema}
+
+Steps so far:
+{transcript}
+
+JSON:"""
+
+
+def compact_schema_text(tables: list[TableSchema]) -> str:
+    """One line per table/view: name(column, column, ...)."""
+    return "\n".join(
+        f"{table.name}({', '.join(column.name for column in table.columns)})"
+        for table in tables
+    )
+
+
+def execute_agent_action(
+    settings: Settings,
+    tables: list[TableSchema],
+    artifacts: list[ResultArtifact],
+    action: str,
+    payload: dict[str, Any],
+    approval_callback: Callable[[str], bool] | None,
+) -> tuple[str | None, str]:
+    """Run one agent action. Returns (observation, detail); observation None ends the loop.
+
+    Every action goes through the existing gates: exploration tools resolve names
+    against the inspected schema, run_sql passes the full SQL validator and the
+    read-only executor with row/timeout caps (honoring REQUIRE_SQL_APPROVAL), and
+    artifact actions are the same deterministic layer as the colon commands. The
+    model never executes anything that a typed command could not.
+    """
+    if action in {"list_tables", "describe_table", "sample_rows", "distinct_values"}:
+        return execute_exploration_action(settings, tables, action, payload)
+
+    if action == "run_sql":
+        sql = str(payload.get("sql") or "").strip()
+        if not sql:
+            return "run_sql needs a sql field.", ""
+        # Keep enough of the SQL that the transcript never shows what looks like a
+        # broken query (which sends the model into a rewrite loop).
+        detail = sql if len(sql) <= 200 else sql[:200] + " ..."
+        try:
+            validate_sql(sql, tables)
+        except SqlValidationError as exc:
+            return f"SQL rejected: {exc}", detail
+        if settings.require_sql_approval:
+            if approval_callback is None or not approval_callback(sql):
+                return "Execution not approved by the user.", detail
+        try:
+            execution = execute_readonly_query(
+                settings.source_db_path,
+                sql,
+                max_rows=settings.max_result_rows,
+                timeout_ms=settings.query_timeout_ms,
+            )
+        except QueryExecutionError as exc:
+            return f"Execution failed: {exc}", detail
+        artifacts.append(
+            ResultArtifact(
+                artifact_id=len(artifacts) + 1,
+                question=f"[agent] {sql[:120]}",
+                sql=sql,
+                columns=execution.columns,
+                rows=execution.rows,
+                truncated=execution.truncated,
+                analysis_text=None,
+                created_at=utc_now(),
+            )
+        )
+        return (
+            result_digest_for_critic(execution.columns, execution.rows, execution.truncated),
+            detail,
+        )
+
+    if action in {"describe", "head", "sort", "select", "filter", "groupby"}:
+        if not artifacts:
+            return "No SQL result yet. Use run_sql first.", ""
+        arg = str(payload.get("arg") or "").strip()
+        return execute_goal_action(settings, artifacts, action, arg), arg
+
+    return None, ""
+
+
+def run_agent(
+    client: OpenAI,
+    settings: Settings,
+    question: str,
+    tables: list[TableSchema],
+    approval_callback: Callable[[str], bool] | None = None,
+) -> AgentRunResult:
+    """ReAct-style agent loop: explore the schema, run validated SQL, analyze, answer.
+
+    Bounded by max_agent_steps; the model only chooses among gated actions and any
+    model failure, parse failure, or unknown action ends the loop. Failed actions
+    feed their error text back as observations so the agent can self-correct.
+    """
+    artifacts: list[ResultArtifact] = []
+    steps: list[AgentStep] = []
+    answer: str | None = None
+    consecutive_repeats = 0
+    schema = compact_schema_text(tables)
+    for _ in range(settings.max_agent_steps):
+        transcript = (
+            "\n".join(
+                f"{index}. {step.action}({step.detail}) -> {step.observation[:300]}"
+                for index, step in enumerate(steps, 1)
+            )
+            or "(none yet)"
+        )
+        prompt = AGENT_PROMPT.format(
+            question=question,
+            schema=schema,
+            transcript=transcript,
+            max_result_rows=settings.max_result_rows,
+        )
+        payload = request_json_payload(
+            client,
+            settings,
+            model=settings.text_to_sql_model,
+            system="You are a data analyst agent. Reply with one JSON object only.",
+            prompt=prompt,
+        )
+        if not payload:
+            break
+        action = str(payload.get("action") or "").strip().lower()
+        thought = str(payload.get("thought") or "").strip()
+        if action == "finish":
+            answer = str(payload.get("answer") or "").strip() or None
+            break
+        observation, detail = execute_agent_action(
+            settings, tables, artifacts, action, payload, approval_callback
+        )
+        if observation is None:
+            break
+        if steps and steps[-1].action == action and steps[-1].detail == detail:
+            consecutive_repeats += 1
+            observation = f"(You already ran this exact action.) {observation}"
+        else:
+            consecutive_repeats = 0
+        steps.append(
+            AgentStep(action=action, detail=detail, thought=thought, observation=observation)
+        )
+        if consecutive_repeats >= 2:
+            break
+    return AgentRunResult(steps=tuple(steps), artifacts=tuple(artifacts), answer=answer)
+
+
 def log_query(settings: Settings, result: AnswerResult) -> None:
     if not settings.enable_query_logging:
         return
@@ -3400,30 +4207,38 @@ def validate_with_repair(
     expectation: ShapeExpectation,
     repair_budget: int,
 ) -> int:
-    """Validate result.sql, repairing once if the budget allows. Returns the remaining budget."""
-    try:
-        validate_sql(result.sql, tables)
-        return repair_budget
-    except SqlValidationError as exc:
-        result.validation_error = str(exc)
-        if repair_budget <= 0:
-            raise
-        result.repair_reason = f"validation failed: {exc}"
-        repair_prompt = build_validation_repair_prompt(
-            result.question,
-            all_schema_text(documents),
-            result.sql,
-            str(exc),
-            settings.max_result_rows,
-            expectation,
-        )
-        repaired = generate_sql(client, settings, repair_prompt)
-        result.sql = repaired.sql
-        result.repaired = True
-        result.token_usage = add_usage(result.token_usage, repaired.usage)
-        validate_sql(result.sql, tables)
-        result.validation_error = None
-        return repair_budget - 1
+    """Validate result.sql, repairing within the budget. Returns the remaining budget.
+
+    Each repair prompt carries the accumulated history of failed SQL and errors so a
+    later attempt does not repeat an earlier mistake.
+    """
+    attempts: list[tuple[str, str]] = []
+    while True:
+        try:
+            validate_sql(result.sql, tables)
+            if attempts:
+                result.validation_error = None
+            return repair_budget
+        except SqlValidationError as exc:
+            result.validation_error = str(exc)
+            if repair_budget <= 0:
+                raise
+            attempts.append((result.sql or "", str(exc)))
+            result.repair_reason = f"validation failed: {exc}"
+            repair_prompt = build_validation_repair_prompt(
+                result.question,
+                all_schema_text(documents),
+                result.sql,
+                str(exc),
+                settings.max_result_rows,
+                expectation,
+                previous_attempts=attempts[:-1],
+            )
+            repaired = generate_sql(client, settings, repair_prompt)
+            result.sql = repaired.sql
+            result.repaired = True
+            result.token_usage = add_usage(result.token_usage, repaired.usage)
+            repair_budget -= 1
 
 
 def check_shape_with_repair(
@@ -3510,7 +4325,18 @@ def answer_question(
         result.expanded_tables = expanded
         expectation = infer_shape_expectation(question)
         prompt_schema = schema_text_for_tables(expanded, documents)
-        prompt = build_sql_prompt(question, prompt_schema, settings.max_result_rows, expectation)
+        examples = retrieve_fewshot_examples(settings, question)
+        exploration: list[ExplorationStep] = []
+        if settings.enable_schema_exploration:
+            exploration = explore_schema(client, settings, question, tables, prompt_schema)
+        prompt = build_sql_prompt(
+            question,
+            prompt_schema,
+            settings.max_result_rows,
+            expectation,
+            examples=examples,
+            exploration=exploration,
+        )
         generation = generate_sql(client, settings, prompt)
         result.sql = generation.sql
         result.initial_sql = generation.initial_sql
@@ -3547,6 +4373,13 @@ def answer_question(
         result.rows = execution.rows
         result.truncated = execution.truncated
         result.execution_ms = execution.execution_ms
+        if settings.enable_llm_result_critic:
+            critique = critique_result(client, settings, question, result.sql or "", execution)
+            if critique is not None and not critique.matches:
+                note = f"Result critic: {critique.reason}"
+                result.shape_warning = (
+                    f"{result.shape_warning} | {note}" if result.shape_warning else note
+                )
         if settings.enable_dataframe_analysis:
             try:
                 result.analysis, result.analysis_text = analyze_execution(
@@ -3621,6 +4454,66 @@ def read_query_logs(settings: Settings, limit: int) -> list[dict[str, Any]]:
             (limit,),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def _question_tokens(text: str) -> frozenset[str]:
+    return frozenset(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def read_successful_query_examples(settings: Settings, limit: int = 50) -> list[tuple[str, str]]:
+    """Most recent successful question->SQL pairs from this database's query log.
+
+    Best-effort like log_query: any metadata read problem yields no examples
+    rather than an error.
+    """
+    if not settings.metadata_path.exists():
+        return []
+    try:
+        with metadata_connection(settings.metadata_path) as conn:
+            setup_metadata(conn)
+            rows = conn.execute(
+                """
+                SELECT question, generated_sql
+                FROM query_logs
+                WHERE success = 1 AND executed = 1 AND cancelled = 0
+                      AND generated_sql IS NOT NULL AND generated_sql != ''
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+    except (sqlite3.Error, OSError):
+        return []
+    return [(str(row[0] or ""), str(row[1])) for row in rows]
+
+
+def retrieve_fewshot_examples(settings: Settings, question: str) -> list[tuple[str, str]]:
+    """Pick the logged question->SQL pairs most similar to the new question.
+
+    Deterministic and offline: token Jaccard overlap, no embeddings and no model
+    call. Ties favor the most recent example; questions are deduplicated and only
+    positive-overlap matches are returned.
+    """
+    if not settings.enable_fewshot_memory:
+        return []
+    target = _question_tokens(question)
+    if not target:
+        return []
+    scored: list[tuple[float, int, tuple[str, str]]] = []
+    seen: set[str] = set()
+    for recency, (past_question, past_sql) in enumerate(read_successful_query_examples(settings)):
+        key = past_question.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        tokens = _question_tokens(past_question)
+        if not tokens:
+            continue
+        overlap = len(target & tokens) / len(target | tokens)
+        if overlap > 0:
+            scored.append((overlap, -recency, (past_question, past_sql)))
+    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [example for _, _, example in scored[: settings.max_fewshot_examples]]
 
 
 def download_northwind(settings: Settings, *, force: bool = False) -> tuple[Path, int]:

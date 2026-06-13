@@ -640,6 +640,602 @@ def test_log_query_is_best_effort_when_metadata_db_unwritable(tmp_path: Path) ->
     log_query(settings, result)  # must not raise
 
 
+def test_fewshot_examples_rank_filter_and_dedupe(tmp_path: Path) -> None:
+    settings = Settings(
+        omlx_api_key="test",
+        db_path=tmp_path / "northwind.db",
+        metadata_db_path=tmp_path / "metadata.db",
+        enable_fewshot_memory=True,
+        max_fewshot_examples=2,
+    )
+
+    def _logged(question: str, *, success: bool = True) -> None:
+        result = AnswerResult(question=question, retrieved_tables=[], expanded_tables=[])
+        result.sql = f"SELECT '{question}'"
+        result.success = success
+        result.executed = success
+        log_query(settings, result)
+
+    _logged("Which customers placed the most orders?")
+    _logged("Total revenue by genre")
+    _logged("Which customers placed the most orders?")  # duplicate question
+    _logged("Which employees placed orders recently?", success=False)
+
+    examples = core.retrieve_fewshot_examples(settings, "Which customers placed orders?")
+    questions = [question for question, _ in examples]
+    assert questions == ["Which customers placed the most orders?"]
+    sql = examples[0][1]
+    assert sql == "SELECT 'Which customers placed the most orders?'"
+
+
+def test_fewshot_examples_disabled_or_unrelated_return_empty(tmp_path: Path) -> None:
+    settings = Settings(
+        omlx_api_key="test",
+        db_path=tmp_path / "northwind.db",
+        metadata_db_path=tmp_path / "metadata.db",
+    )
+    assert core.retrieve_fewshot_examples(settings, "anything") == []
+
+    enabled = settings.model_copy(update={"enable_fewshot_memory": True})
+    result = AnswerResult(question="Total freight", retrieved_tables=[], expanded_tables=[])
+    result.sql = "SELECT 1"
+    result.success = True
+    result.executed = True
+    log_query(enabled, result)
+    assert core.retrieve_fewshot_examples(enabled, "customers by country") == []
+
+
+def test_build_sql_prompt_examples_section() -> None:
+    expectation = infer_shape_expectation("Which customers placed the most orders?")
+    base = core.build_sql_prompt("q", "SCHEMA", 50, expectation)
+    assert "Past successful queries" not in base
+
+    with_examples = core.build_sql_prompt(
+        "q", "SCHEMA", 50, expectation, examples=[("Old question", "SELECT 1")]
+    )
+    assert "Past successful queries for this database" in with_examples
+    assert "Q: Old question" in with_examples
+    assert "SQL: SELECT 1" in with_examples
+    assert with_examples.index("Past successful") < with_examples.index("Relevant schema:")
+
+
+class _CapturingCompletions:
+    def __init__(self, responses: list[str]) -> None:
+        self._responses = responses
+        self.calls = 0
+        self.prompts: list[str] = []
+
+    def create(self, model: str, messages: list, **kwargs: object) -> SimpleNamespace:
+        del model, kwargs
+        self.prompts.append(messages[-1]["content"])
+        content = self._responses[min(self.calls, len(self._responses) - 1)]
+        self.calls += 1
+        usage = SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+            usage=usage,
+        )
+
+
+def _items_schema(tmp_path: Path) -> tuple[Path, list]:
+    db = tmp_path / "shop.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE items (id INTEGER, name TEXT)")
+    conn.commit()
+    conn.close()
+    return db, core.extract_schema(db)
+
+
+def test_validate_with_repair_accumulates_attempt_history(tmp_path: Path) -> None:
+    db, tables = _items_schema(tmp_path)
+    settings = Settings(
+        omlx_api_key="test",
+        db_path=db,
+        metadata_db_path=tmp_path / "metadata.db",
+        max_repair_attempts=2,
+    )
+    completions = _CapturingCompletions(
+        ["SELECT wrong FROM missing_table", "SELECT id, name FROM items"]
+    )
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    result = AnswerResult(question="list items", retrieved_tables=[], expanded_tables=[])
+    result.sql = "SELECT nope FROM items_missing"
+    remaining = core.validate_with_repair(
+        client, settings, result, tables, [], infer_shape_expectation("list items"), 2
+    )
+
+    assert remaining == 0
+    assert result.sql == "SELECT id, name FROM items"
+    assert result.repaired is True
+    assert result.validation_error is None
+    assert len(completions.prompts) == 2
+    assert "Earlier failed attempts" not in completions.prompts[0]
+    assert "Earlier failed attempts" in completions.prompts[1]
+    assert "SELECT nope FROM items_missing" in completions.prompts[1]
+    assert "SELECT wrong FROM missing_table" in completions.prompts[1]
+
+
+def test_validate_with_repair_raises_when_budget_exhausted(tmp_path: Path) -> None:
+    db, tables = _items_schema(tmp_path)
+    settings = Settings(
+        omlx_api_key="test",
+        db_path=db,
+        metadata_db_path=tmp_path / "metadata.db",
+        max_repair_attempts=1,
+    )
+    completions = _CapturingCompletions(["SELECT still_wrong FROM missing_table"])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    result = AnswerResult(question="list items", retrieved_tables=[], expanded_tables=[])
+    result.sql = "SELECT nope FROM items_missing"
+    with pytest.raises(core.SqlValidationError):
+        core.validate_with_repair(
+            client, settings, result, tables, [], infer_shape_expectation("list items"), 1
+        )
+    assert result.validation_error is not None
+    assert "missing_table" in result.validation_error or "still_wrong" in result.validation_error
+
+
+def _routing_client(content: str) -> SimpleNamespace:
+    return SimpleNamespace(chat=SimpleNamespace(completions=_CapturingCompletions([content])))
+
+
+def test_llm_route_followup_accepts_allowlisted_command() -> None:
+    settings = Settings(omlx_api_key="test")
+    client = _routing_client('{"command": "sort", "arg": "column=TotalRevenue order=desc"}')
+    route = core.llm_route_followup(
+        client, settings, "biggest revenue first", ("GenreName", "TotalRevenue")
+    )
+    assert route is not None
+    assert route.command == "sort"
+    assert route.arg == "column=TotalRevenue order=desc"
+    assert route.reason == "llm-fallback"
+
+
+def test_extract_json_object_takes_first_of_multiple_objects() -> None:
+    raw = (
+        '{"action": "describe_table", "table": "Products"}\n</think>\n\n'
+        '{"action": "describe_table", "table": "Categories"}\n\n{"action": "done"}'
+    )
+    parsed = core.extract_json_object(raw)
+    assert parsed == {"action": "describe_table", "table": "Products"}
+
+    with_prose = 'Let me think {not json} ok here: {"a": 1} trailing'
+    assert core.extract_json_object(with_prose) == {"a": 1}
+
+
+def test_llm_route_followup_tolerates_fenced_json() -> None:
+    settings = Settings(omlx_api_key="test")
+    client = _routing_client('```json\n{"command": "head", "arg": "5"}\n```')
+    route = core.llm_route_followup(client, settings, "first five", ("A",))
+    assert route is not None
+    assert route.command == "head"
+    assert route.arg == "5"
+
+
+def test_llm_route_followup_rejects_none_disallowed_and_garbage() -> None:
+    settings = Settings(omlx_api_key="test")
+    cases = [
+        '{"command": "none", "arg": ""}',
+        '{"command": "delete-workspace", "arg": "ws"}',
+        '{"command": "save", "arg": ""}',
+        "not json at all",
+        '["command", "head"]',
+    ]
+    for content in cases:
+        assert core.llm_route_followup(_routing_client(content), settings, "x", ("A",)) is None
+
+
+def test_llm_route_followup_swallows_model_errors() -> None:
+    settings = Settings(omlx_api_key="test")
+
+    class FailingCompletions:
+        def create(self, *args: object, **kwargs: object) -> SimpleNamespace:
+            raise openai.APIConnectionError(request=httpx.Request("POST", "http://localhost"))
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=FailingCompletions()))
+    assert core.llm_route_followup(client, settings, "x", ("A",)) is None
+
+
+def _critic_execution() -> core.ExecutionResult:
+    return core.ExecutionResult(
+        columns=("Country", "Total"),
+        rows=(("USA", 100), ("UK", 50)),
+        truncated=False,
+        execution_ms=1.0,
+    )
+
+
+def test_critique_result_parses_match_and_mismatch() -> None:
+    settings = Settings(omlx_api_key="test")
+    execution = _critic_execution()
+
+    ok = core.critique_result(
+        _routing_client('{"matches": true, "reason": "looks right"}'),
+        settings,
+        "Total by country?",
+        "SELECT 1",
+        execution,
+    )
+    assert ok is not None and ok.matches is True
+
+    bad = core.critique_result(
+        _routing_client('{"matches": false, "reason": "question asked for a single count"}'),
+        settings,
+        "How many countries?",
+        "SELECT 1",
+        execution,
+    )
+    assert bad is not None and bad.matches is False
+    assert "single count" in bad.reason
+
+
+def test_critique_result_rejects_garbage_and_nonbool() -> None:
+    settings = Settings(omlx_api_key="test")
+    execution = _critic_execution()
+    for content in ["no json here", '{"matches": "yes", "reason": "r"}', '{"reason": "r"}']:
+        verdict = core.critique_result(
+            _routing_client(content), settings, "q", "SELECT 1", execution
+        )
+        assert verdict is None
+
+
+def test_result_digest_for_critic_is_bounded() -> None:
+    rows = tuple((f"r{i}", i) for i in range(12))
+    digest = core.result_digest_for_critic(("Name", "N"), rows, truncated=True, max_preview=5)
+    assert "Columns: Name, N" in digest
+    assert "Row count: 12 (display truncated)" in digest
+    assert "... 7 more rows" in digest
+    assert "r11" not in digest
+
+
+def _seeded_products_db(tmp_path: Path) -> tuple[Path, list]:
+    db = tmp_path / "shop_products.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, category TEXT);
+        INSERT INTO products VALUES (1, 'Apple', 'fruit'), (2, 'Beet', 'veg'), (3, 'Cherry', 'fruit');
+        """
+    )
+    conn.commit()
+    conn.close()
+    return db, core.extract_schema(db)
+
+
+def test_execute_exploration_action_tools(tmp_path: Path) -> None:
+    db, tables = _seeded_products_db(tmp_path)
+    settings = Settings(omlx_api_key="test", db_path=db, metadata_db_path=tmp_path / "m.db")
+
+    listed, _ = core.execute_exploration_action(settings, tables, "list_tables", {})
+    assert "products" in listed
+
+    described, detail = core.execute_exploration_action(
+        settings, tables, "describe_table", {"table": "PRODUCTS"}
+    )
+    assert detail == "products"
+    assert "category TEXT" in described
+
+    sampled, _ = core.execute_exploration_action(
+        settings, tables, "sample_rows", {"table": "products", "limit": 2}
+    )
+    assert "Apple" in sampled
+    assert "Cherry" not in sampled
+
+    distinct, detail = core.execute_exploration_action(
+        settings, tables, "distinct_values", {"table": "products", "column": "Category"}
+    )
+    assert detail == "products.category"
+    assert "fruit" in distinct and "veg" in distinct
+
+    unknown_table, _ = core.execute_exploration_action(
+        settings, tables, "sample_rows", {"table": "nope"}
+    )
+    assert "Unknown table" in unknown_table
+
+    unknown_column, _ = core.execute_exploration_action(
+        settings, tables, "distinct_values", {"table": "products", "column": "missing"}
+    )
+    assert "Unknown column" in unknown_column
+
+    invalid, _ = core.execute_exploration_action(
+        settings, tables, "drop_table", {"table": "products"}
+    )
+    assert invalid is None
+
+
+def test_explore_schema_runs_tools_until_done(tmp_path: Path) -> None:
+    db, tables = _seeded_products_db(tmp_path)
+    settings = Settings(
+        omlx_api_key="test",
+        db_path=db,
+        metadata_db_path=tmp_path / "m.db",
+        enable_schema_exploration=True,
+        max_exploration_calls=4,
+    )
+    completions = _CapturingCompletions(
+        [
+            '{"action": "list_tables"}',
+            '{"action": "sample_rows", "table": "products", "limit": 2}',
+            '{"action": "done"}',
+        ]
+    )
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    steps = core.explore_schema(client, settings, "what categories exist?", tables, "SCHEMA")
+    assert [step.action for step in steps] == ["list_tables", "sample_rows"]
+    assert "Apple" in steps[1].observation
+    assert "list_tables" in completions.prompts[1]  # transcript carried forward
+
+
+def test_explore_schema_respects_budget(tmp_path: Path) -> None:
+    db, tables = _seeded_products_db(tmp_path)
+    settings = Settings(
+        omlx_api_key="test",
+        db_path=db,
+        metadata_db_path=tmp_path / "m.db",
+        max_exploration_calls=2,
+    )
+    completions = _CapturingCompletions(['{"action": "list_tables"}'])  # never says done
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    steps = core.explore_schema(client, settings, "q", tables, "SCHEMA")
+    assert len(steps) == 2
+
+
+def test_decompose_question_parses_caps_and_falls_back() -> None:
+    settings = Settings(omlx_api_key="test")
+
+    good = core.decompose_question(
+        _routing_client('{"sub_questions": ["Top customers?", "Top products?"]}'),
+        settings,
+        "Compare top customers and products",
+    )
+    assert good == ["Top customers?", "Top products?"]
+
+    capped = core.decompose_question(
+        _routing_client('{"sub_questions": ["a", "b", "c", "d", "e"]}'), settings, "q"
+    )
+    assert len(capped) == 3
+
+    for content in ["garbage", '{"sub_questions": "not a list"}', '{"other": []}']:
+        assert core.decompose_question(_routing_client(content), settings, "q") == []
+
+
+def test_synthesize_multi_answer_grounds_on_artifacts() -> None:
+    settings = Settings(omlx_api_key="test")
+    artifacts = [
+        ResultArtifact(
+            artifact_id=1,
+            question="Top customer?",
+            sql="SELECT 1",
+            columns=("Customer", "Orders"),
+            rows=(("Acme", 12),),
+            truncated=False,
+            analysis_text=None,
+            created_at="2026-06-12T00:00:00Z",
+        ),
+        ResultArtifact(
+            artifact_id=2,
+            question="Top product?",
+            sql="SELECT 2",
+            columns=("Product", "Units"),
+            rows=(("Widget", 99),),
+            truncated=False,
+            analysis_text=None,
+            created_at="2026-06-12T00:00:00Z",
+        ),
+    ]
+    completions = _CapturingCompletions(
+        ['{"thought": "t", "answer": "Acme leads with 12 orders; Widget leads with 99 units."}']
+    )
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    answer = core.synthesize_multi_answer(client, settings, "Compare leaders", artifacts)
+    assert answer == "Acme leads with 12 orders; Widget leads with 99 units."
+    prompt = completions.prompts[0]
+    assert "Sub-question 1: Top customer?" in prompt
+    assert "Acme | 12" in prompt
+    assert "Widget | 99" in prompt
+
+
+def _goal_artifact() -> ResultArtifact:
+    return ResultArtifact(
+        artifact_id=1,
+        question="Revenue by genre",
+        sql="SELECT 1",
+        columns=("Genre", "Revenue"),
+        rows=(("Rock", 800), ("Jazz", 120), ("Pop", 450)),
+        truncated=False,
+        analysis_text=None,
+        created_at="2026-06-12T00:00:00Z",
+    )
+
+
+def test_run_goal_executes_steps_and_finishes(tmp_path: Path) -> None:
+    settings = Settings(
+        omlx_api_key="test",
+        db_path=tmp_path / "n.db",
+        metadata_db_path=tmp_path / "m.db",
+        max_goal_steps=5,
+    )
+    completions = _CapturingCompletions(
+        [
+            '{"thought": "sort it", "action": "sort", "arg": "column=Revenue order=desc"}',
+            '{"thought": "enough", "action": "finish", "arg": "Rock leads with 800."}',
+        ]
+    )
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    artifacts = [_goal_artifact()]
+
+    outcome = core.run_goal(client, settings, "rank genres by revenue", artifacts)
+
+    assert [step.action for step in outcome.steps] == ["sort"]
+    assert outcome.findings == "Rock leads with 800."
+    assert outcome.artifacts_created == 1
+    assert len(artifacts) == 2
+    assert artifacts[-1].rows[0] == ("Rock", 800)  # sorted desc
+    assert "Rock | 800" in completions.prompts[1]  # new digest fed forward
+
+
+def test_run_goal_records_failed_action_and_respects_budget(tmp_path: Path) -> None:
+    settings = Settings(
+        omlx_api_key="test",
+        db_path=tmp_path / "n.db",
+        metadata_db_path=tmp_path / "m.db",
+        max_goal_steps=2,
+    )
+    completions = _CapturingCompletions(
+        ['{"thought": "", "action": "sort", "arg": "column=Missing order=desc"}']
+    )
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    artifacts = [_goal_artifact()]
+
+    outcome = core.run_goal(client, settings, "rank genres", artifacts)
+
+    assert len(outcome.steps) == 2  # budget consumed; failures observed, not raised
+    assert all("Action failed" in step.observation for step in outcome.steps)
+    assert outcome.findings is None
+    assert outcome.artifacts_created == 0
+    assert len(artifacts) == 1
+
+
+def test_run_goal_stops_on_unknown_action(tmp_path: Path) -> None:
+    settings = Settings(
+        omlx_api_key="test",
+        db_path=tmp_path / "n.db",
+        metadata_db_path=tmp_path / "m.db",
+    )
+    completions = _CapturingCompletions(
+        ['{"thought": "", "action": "delete_everything", "arg": ""}']
+    )
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    artifacts = [_goal_artifact()]
+    outcome = core.run_goal(client, settings, "g", artifacts)
+    assert outcome.steps == ()
+    assert len(artifacts) == 1
+
+
+def test_execute_agent_action_run_sql_validates_and_stores_artifact(tmp_path: Path) -> None:
+    db, tables = _seeded_products_db(tmp_path)
+    settings = Settings(omlx_api_key="test", db_path=db, metadata_db_path=tmp_path / "m.db")
+    artifacts: list[ResultArtifact] = []
+
+    rejected, _ = core.execute_agent_action(
+        settings, tables, artifacts, "run_sql", {"sql": "DELETE FROM products"}, None
+    )
+    assert "SQL rejected" in rejected
+    assert artifacts == []
+
+    observation, detail = core.execute_agent_action(
+        settings,
+        tables,
+        artifacts,
+        "run_sql",
+        {"sql": "SELECT name, category FROM products ORDER BY name"},
+        None,
+    )
+    assert "Apple | fruit" in observation
+    assert detail.startswith("SELECT name, category")
+    assert len(artifacts) == 1
+    assert artifacts[0].columns == ("name", "category")
+
+    transformed, _ = core.execute_agent_action(
+        settings,
+        tables,
+        artifacts,
+        "filter",
+        {"arg": "column=category op=eq value=fruit"},
+        None,
+    )
+    assert "Apple" in transformed and "Beet" not in transformed
+    assert len(artifacts) == 2
+
+    unknown, _ = core.execute_agent_action(settings, tables, artifacts, "explode", {}, None)
+    assert unknown is None
+
+
+def test_execute_agent_action_honors_approval_gate(tmp_path: Path) -> None:
+    db, tables = _seeded_products_db(tmp_path)
+    settings = Settings(
+        omlx_api_key="test",
+        db_path=db,
+        metadata_db_path=tmp_path / "m.db",
+        require_sql_approval=True,
+    )
+    artifacts: list[ResultArtifact] = []
+
+    denied, _ = core.execute_agent_action(
+        settings, tables, artifacts, "run_sql", {"sql": "SELECT name FROM products"}, None
+    )
+    assert "not approved" in denied
+    assert artifacts == []
+
+    approved, _ = core.execute_agent_action(
+        settings,
+        tables,
+        artifacts,
+        "run_sql",
+        {"sql": "SELECT name FROM products"},
+        lambda sql: True,
+    )
+    assert "Apple" in approved
+    assert len(artifacts) == 1
+
+
+def test_run_agent_loops_to_answer(tmp_path: Path) -> None:
+    db, tables = _seeded_products_db(tmp_path)
+    settings = Settings(
+        omlx_api_key="test",
+        db_path=db,
+        metadata_db_path=tmp_path / "m.db",
+        max_agent_steps=5,
+    )
+    completions = _CapturingCompletions(
+        [
+            '{"thought": "look", "action": "sample_rows", "table": "products", "limit": 2}',
+            '{"thought": "query", "action": "run_sql", "sql": "SELECT category, COUNT(*) AS n FROM products GROUP BY category"}',
+            '{"thought": "answer", "action": "finish", "answer": "fruit has 2 products, veg has 1."}',
+        ]
+    )
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    outcome = core.run_agent(client, settings, "products per category?", tables)
+
+    assert [step.action for step in outcome.steps] == ["sample_rows", "run_sql"]
+    assert len(outcome.artifacts) == 1
+    assert outcome.artifacts[0].rows == (("fruit", 2), ("veg", 1))
+    assert outcome.answer == "fruit has 2 products, veg has 1."
+    assert "sample_rows" in completions.prompts[1]  # transcript carried forward
+    assert "fruit | 2" in completions.prompts[2]
+
+
+def test_run_agent_breaks_on_repeated_actions(tmp_path: Path) -> None:
+    db, tables = _seeded_products_db(tmp_path)
+    settings = Settings(
+        omlx_api_key="test",
+        db_path=db,
+        metadata_db_path=tmp_path / "m.db",
+        max_agent_steps=8,
+    )
+    completions = _CapturingCompletions(['{"thought": "", "action": "list_tables"}'])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    outcome = core.run_agent(client, settings, "q", tables)
+    # original + two identical repeats, then the repeat guard ends the loop
+    assert len(outcome.steps) == 3
+    assert "already ran this exact action" in outcome.steps[-1].observation
+    assert outcome.answer is None
+
+
+def test_exploration_notes_render_into_sql_prompt() -> None:
+    steps = [core.ExplorationStep("list_tables", "", "Tables/views: products (table)")]
+    expectation = infer_shape_expectation("q")
+    prompt = core.build_sql_prompt("q", "SCHEMA", 50, expectation, exploration=steps)
+    assert "Exploration notes (from read-only database inspection):" in prompt
+    assert "products (table)" in prompt
+    assert prompt.index("Exploration notes") < prompt.index("Relevant schema:")
+
+
 def test_read_query_logs_returns_dict_rows_with_expected_keys(tmp_path: Path) -> None:
     settings = Settings(
         omlx_api_key="test",

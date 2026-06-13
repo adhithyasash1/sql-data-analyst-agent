@@ -1,6 +1,6 @@
 [project]
 name = "sql-data-analyst-agent"
-version = "0.3.11"
+version = "0.3.12"
 description = "A local Text-to-SQL CLI for SQLite databases with optional dataframe result analysis."
 readme = "README.md"
 requires-python = ">=3.11"

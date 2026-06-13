@@ -55,6 +55,14 @@ class Settings(BaseSettings):
     enable_dataframe_analysis: bool = False
     max_analysis_rows: int = 5000
     max_analysis_columns: int = 30
+    enable_fewshot_memory: bool = False
+    max_fewshot_examples: int = 3
+    enable_llm_router_fallback: bool = False
+    enable_llm_result_critic: bool = False
+    enable_schema_exploration: bool = False
+    max_exploration_calls: int = 4
+    max_goal_steps: int = 6
+    max_agent_steps: int = 8
     output_dir: Path = Path("data/outputs")
 
     @field_validator(
@@ -68,6 +76,7 @@ class Settings(BaseSettings):
         "max_profile_text_length",
         "max_analysis_rows",
         "max_analysis_columns",
+        "max_fewshot_examples",
     )
     @classmethod
     def must_be_positive(cls, value: int) -> int:
@@ -80,6 +89,27 @@ class Settings(BaseSettings):
     def repair_attempts_are_bounded(cls, value: int) -> int:
         if value < 0 or value > 3:
             raise ValueError("must be between 0 and 3")
+        return value
+
+    @field_validator("max_exploration_calls")
+    @classmethod
+    def exploration_calls_are_bounded(cls, value: int) -> int:
+        if value < 1 or value > 8:
+            raise ValueError("must be between 1 and 8")
+        return value
+
+    @field_validator("max_goal_steps")
+    @classmethod
+    def goal_steps_are_bounded(cls, value: int) -> int:
+        if value < 1 or value > 10:
+            raise ValueError("must be between 1 and 10")
+        return value
+
+    @field_validator("max_agent_steps")
+    @classmethod
+    def agent_steps_are_bounded(cls, value: int) -> int:
+        if value < 1 or value > 12:
+            raise ValueError("must be between 1 and 12")
         return value
 
     @field_validator("sql_temperature", "summary_temperature")

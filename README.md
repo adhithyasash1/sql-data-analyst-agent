@@ -9,6 +9,11 @@ a **read-only** connection, and renders the result with Rich. Everything after t
 transformations, correlation, charts, reports, even supervised ML — is **deterministic Python over
 the rows you already fetched**: no model-generated code is ever executed.
 
+On top of that sits an **opt-in agentic layer**: query-log memory, schema exploration tools, a
+result critic, a natural-language router fallback, multi-step question decomposition, goal-driven
+analysis, and a full bounded agent loop (`ask --agent`). In every one of them the model only
+*chooses among* the same validated, read-only, budget-capped actions — it never gains new powers.
+
 ```text
 > Which genres generated the most revenue?
   ┌────────────┬──────────────┬────────────┐
@@ -28,7 +33,10 @@ the rows you already fetched**: no model-generated code is ever executed.
 - **Schema-aware generation** — table/view documents with bounded sample profiles, embedded via a
   local OpenAI-compatible endpoint and retrieved with sqlite-vec, expanded one hop through foreign keys.
 - **Self-checking** — structural validation, schema checks, result-shape heuristics, and a bounded
-  one-shot repair loop.
+  repair loop where each retry sees the history of failed SQL and errors.
+- **Opt-in agentic layer** — few-shot memory from query logs, read-only schema exploration, an LLM
+  result critic, `:multi` decomposition, `:goal` analysis loops, and `ask --agent` — all default-off,
+  budget-bounded, and confined to the same gated actions as typed commands.
 - **Deterministic analysis layer** — profile, sort/select/filter/groupby, Pearson correlation,
   charts, and fixed-recipe supervised ML (preflight-gated, opt-in `--run`).
 - **Persistent workspaces and reports** — save session artifacts to disk, reload them later, and
@@ -45,7 +53,9 @@ The runtime path is intentionally bounded:
 3. Generate candidate SQL with the local model.
 4. Validate structural safety with SQLGlot plus schema checks.
 5. Execute on a read-only SQLite connection with timeout and row limits.
-6. Optionally repair once on validation failure or a high-confidence result-shape mismatch.
+6. Optionally repair within the `MAX_REPAIR_ATTEMPTS` budget on validation failure or a
+   high-confidence result-shape mismatch — each retry prompt carries the accumulated history of
+   failed SQL and errors.
 7. Show the SQL, the result table, and a concise summary.
 
 Validation proves the SQL is structurally safe and executable — not that it perfectly answers the
@@ -113,13 +123,15 @@ continues instead of failing.
 | --- | --- |
 | `index [--db <path>]` | Inspect the database and build/rebuild its schema index |
 | `ask [--db <path>] ["<question>"]` | Answer one question, or start the interactive session when no question is given |
+| `ask --agent "<question>"` | Answer with the bounded multi-step agent loop (explore, query, analyze) |
 | `logs [--db <path>] [--limit N] [--verbose]` | Show recent query logs for the selected database |
 | `download-northwind` | Download the pinned MIT-licensed Northwind demo database |
 
 ## Interactive session
 
 Inside `ask`, each successful query stores an in-memory **result artifact**. Colon commands operate
-on artifacts deterministically — they never call the model and never execute generated code.
+on artifacts deterministically — apart from the explicitly agentic `:multi` and `:goal`, they never
+call the model, and none of them ever execute generated code.
 **Artifacts and analysis digests stay in memory until you explicitly export or `:save`.**
 
 The session is interrupt-safe: **Ctrl+C** at the prompt re-prompts, **Ctrl+C** during a running
@@ -196,6 +208,13 @@ against the **latest artifact's** columns (not the database schema), there is no
 and anything ambiguous or unrecognized is treated as a new database question — `top 5 genres by
 revenue` still runs the Text-to-SQL pipeline. The router is interactive-only; one-shot
 `ask "<question>"` never routes.
+
+With `ENABLE_LLM_ROUTER_FALLBACK=true`, a follow-up the deterministic router cannot parse (e.g.
+`keep only rows where the freight is above 400000`) is offered to the model, which may map it to
+one allowlisted artifact command via a strict JSON reply — the session then prints
+`Routed to :<command> (model-routed)` and runs the **same deterministic handler** as a typed
+command. Only read-only/transform commands are routable (never workspace save/load/delete, never
+`:analyze`); anything the model cannot map cleanly falls through to a new database question.
 
 ### Analyze
 
@@ -276,6 +295,46 @@ sort by TotalRevenue descending
 :report html workspace=genre_revenue
 ```
 
+## Agentic features (all opt-in)
+
+The agentic layer lets the model *choose* what to do next — but every choice is validated against
+an allowlist, executed by the same gated code paths as typed commands, and bounded by a step
+budget. Default behavior with every flag off is identical to the non-agentic releases. All JSON
+replies from the model are parsed best-effort: a model error, an unparseable reply, or an
+out-of-allowlist action simply degrades to the plain pipeline instead of failing.
+
+### Pipeline upgrades (env flags)
+
+| Flag | What it adds |
+| --- | --- |
+| `ENABLE_FEWSHOT_MEMORY` | Injects up to `MAX_FEWSHOT_EXAMPLES` past **successful** question→SQL pairs from this database's query log into the SQL prompt, ranked by deterministic token overlap — no embeddings, no extra model call. The agent gets better on *your* database as the log grows. |
+| `ENABLE_SCHEMA_EXPLORATION` | Before SQL is written, the model may call up to `MAX_EXPLORATION_CALLS` read-only tools — `list_tables`, `describe_table`, `sample_rows` (≤5 rows), `distinct_values` (≤10 values) — to ground its query in real data (e.g. discovering that `Discontinued` is 0/1). Table and column names resolve against the inspected schema; the only SQL shapes are fixed `SELECT ... LIMIT` templates through the read-only executor. |
+| `ENABLE_LLM_RESULT_CRITIC` | After execution, a reflection call judges whether the result plausibly answers the question, grounded in the SQL and a bounded result digest. A mismatch verdict is **advisory**: it surfaces through the existing shape-warning channel and never re-runs anything. |
+| `ENABLE_LLM_ROUTER_FALLBACK` | Model-assisted routing of fuzzy follow-ups to allowlisted artifact commands (see Natural-language follow-ups above). |
+
+### Multi-step commands
+
+```text
+:multi <question>     # interactive: decompose → answer each sub-question → synthesize
+:goal <objective>     # interactive: model-chosen deterministic steps over the latest result
+ask --agent "<q>"     # one-shot CLI: full explore/query/analyze agent loop
+```
+
+- **`:multi`** asks the model to split a complex question into at most 3 plain-English
+  sub-questions, runs each through the full validated Text-to-SQL pipeline (each result becomes a
+  normal session artifact), then renders a grounded cross-result synthesis that quotes numbers
+  exactly as returned.
+- **`:goal`** runs a bounded loop (`MAX_GOAL_STEPS`) in which the model picks among `describe`,
+  `head`, `sort`, `select`, `filter`, and `groupby` on the latest artifact, observes each result
+  digest, and finishes with findings. Transforms land in the session artifact list like any typed
+  command; failed actions feed their error text back as observations so the model can adjust.
+- **`ask --agent`** is the umbrella loop (`MAX_AGENT_STEPS`): schema exploration tools, `run_sql`
+  (full SQLGlot validation, read-only executor, `REQUIRE_SQL_APPROVAL` honored per query), and the
+  artifact transforms — ending in a grounded answer. It can answer multi-hop questions a single
+  SELECT cannot (e.g. *"Which employee handled the most orders, and what were that employee's
+  three biggest orders by freight?"*). Each step is printed; a repeat-guard stops the loop if the
+  model re-runs an identical action.
+
 ## Configuration
 
 Settings load from `.env` (see `.env.example`). The most useful ones:
@@ -289,7 +348,7 @@ Settings load from `.env` (see `.env.example`). The most useful ones:
 | `AUTO_REINDEX` | `true` | Rebuild the index when schema/model/path changes |
 | `MAX_RESULT_ROWS` | `50` | Display row cap per result |
 | `QUERY_TIMEOUT_MS` | `3000` | Read-only execution timeout |
-| `MAX_REPAIR_ATTEMPTS` | `1` | Total SQL repair budget |
+| `MAX_REPAIR_ATTEMPTS` | `1` | Total SQL repair budget (0–3); each retry sees prior failed attempts |
 | `REQUIRE_SQL_APPROVAL` | `false` | Ask before executing validated SQL |
 | `ENABLE_RESULT_SHAPE_CHECK` | `true` | Result-shape heuristics (disable if noisy on unusual schemas) |
 | `ENABLE_LLM_SUMMARY` | `false` | Optional second model call for a grounded narrative summary |
@@ -300,6 +359,14 @@ Settings load from `.env` (see `.env.example`). The most useful ones:
 | `ENABLE_DATAFRAME_ANALYSIS` | `false` | Post-answer profiling panel (needs the `analysis` extra) |
 | `MAX_ANALYSIS_ROWS` | `5000` | Cap for bounded analysis re-fetches |
 | `MAX_ANALYSIS_COLUMNS` | `30` | Max columns in the analysis panel / summary grounding |
+| `ENABLE_FEWSHOT_MEMORY` | `false` | Inject past successful question→SQL pairs into the SQL prompt |
+| `MAX_FEWSHOT_EXAMPLES` | `3` | Max few-shot examples per prompt |
+| `ENABLE_LLM_ROUTER_FALLBACK` | `false` | Model-assisted routing of fuzzy follow-ups to artifact commands |
+| `ENABLE_LLM_RESULT_CRITIC` | `false` | Advisory post-execution verdict on whether the result answers the question |
+| `ENABLE_SCHEMA_EXPLORATION` | `false` | Pre-generation read-only schema tool loop |
+| `MAX_EXPLORATION_CALLS` | `4` | Exploration tool-call budget (1–8) |
+| `MAX_GOAL_STEPS` | `6` | `:goal` step budget (1–10) |
+| `MAX_AGENT_STEPS` | `8` | `ask --agent` step budget (1–12) |
 | `OUTPUT_DIR` | `data/outputs` | CSV exports, `charts/`, `reports/`, `workspaces/` (gitignored) |
 
 Schema profiling reads only through the read-only connection and never modifies the source
@@ -326,6 +393,11 @@ multi-database backend.
 - **Confined workspace operations** — reads, writes, and deletions are restricted to
   `OUTPUT_DIR/workspaces/`; absolute paths, separators, and `..` traversal are rejected.
 - **Offline reports** — exports use stored rows and saved digests only; no SQL re-runs, no model calls.
+- **Gated agentic actions** — every opt-in agentic feature (router fallback, exploration, critic,
+  `:multi`, `:goal`, `ask --agent`) only lets the model *choose among* the existing validated,
+  read-only operations: identifiers resolve against the inspected schema, every SQL passes the
+  same validator and read-only executor, `REQUIRE_SQL_APPROVAL` is honored per query, and every
+  loop has a hard step budget.
 - **Friendly failures** — model/connection problems surface as readable `AppError` notices, not
   stack traces; keyboard interrupts cancel cleanly without losing the session; query logging is
   best-effort and never fails an answer.
@@ -335,7 +407,7 @@ multi-database backend.
 | File | Responsibility |
 | --- | --- |
 | `app.py` | Typer commands, interactive prompt, Rich rendering |
-| `core.py` | Schema inspection, indexing, retrieval, prompting, SQL validation, read-only execution, artifacts, workspaces, reports |
+| `core.py` | Schema inspection, indexing, retrieval, prompting, SQL validation, read-only execution, artifacts, workspaces, reports, agentic loops (exploration, goal, agent) |
 | `analysis/` | Deterministic analysis: capability detection, planning, profile/correlation execution, supervised preflight and fixed-recipe ML runs |
 | `config.py` | pydantic-settings configuration loaded from `.env` |
 | `data/metadata/` | Per-database schema index, sqlite-vec vectors, index state, query logs |
@@ -361,6 +433,12 @@ package, and runs fully offline — no model server required.
 - `:analyze correlate` may describe a capped subset when a bounded re-fetch still hits
   `MAX_ANALYSIS_ROWS`.
 - Result analysis is descriptive profiling, not statistical inference.
+- Agentic features depend on the local model following a JSON action protocol. Replies are parsed
+  best-effort (reasoning preamble and multiple JSON objects are tolerated); when a reply cannot be
+  used, the feature quietly degrades — no route, no critique, no decomposition — rather than
+  erroring. Quality varies with the model served.
+- `ask --agent` prints its steps but does not record them in the query log; only the standard
+  pipeline logs queries.
 
 ## Sources
 
